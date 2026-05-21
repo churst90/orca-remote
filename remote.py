@@ -157,6 +157,13 @@ class RemoteExtension(Extension):
         # menu items flip these without restarting the transport.
         self._mirror_speech: bool = True
         self._mirror_braille: bool = True
+        # Singleton dialog refs. Set before show_all() so a rapid
+        # second Orca+Ctrl+R refocuses the existing window instead of
+        # stacking duplicates (pre-0.5.6 behavior was that each press
+        # opened another settings/menu dialog). Cleared by the dialog
+        # response callback before destroy.
+        self._menu_dialog: Any = None
+        self._settings_dialog: Any = None
         super().__init__()
 
     # ---- lifecycle -------------------------------------------------
@@ -459,9 +466,26 @@ class RemoteExtension(Extension):
         return True
 
     def open_settings(self) -> bool:
-        """Show the non-blocking settings dialog; apply on OK."""
+        """Show the non-blocking settings dialog; apply on OK.
 
-        build_settings_dialog(dict(self._settings), self._on_settings_result)
+        Singleton: if a settings dialog is already open, refocus it
+        instead of stacking a duplicate. Pre-0.5.6 behavior was that
+        rapid Orca+Ctrl+R presses (or a remote master synthesizing
+        the chord) opened a fresh dialog each time, which the user
+        had to dismiss one by one.
+        """
+
+        if self._settings_dialog is not None:
+            try:
+                self._settings_dialog.present()
+            except Exception:  # pylint: disable=broad-except
+                # Dialog dead but ref not yet cleared; fall through
+                # and build a new one.
+                self._settings_dialog = None
+        if self._settings_dialog is None:
+            self._settings_dialog = build_settings_dialog(
+                dict(self._settings), self._on_settings_result,
+            )
         return True
 
     def open_menu(self) -> bool:
@@ -471,7 +495,19 @@ class RemoteExtension(Extension):
         button's callback runs after the dialog destroys itself so a
         chosen action can open its own follow-up dialog (e.g. the
         settings window) without z-order issues.
+
+        Singleton: a second Orca+Ctrl+R refocuses the existing menu
+        instead of stacking. The menu is short-lived (user picks an
+        item or hits Close), so this is mostly a guard against rapid
+        double-press from the user or a remote master.
         """
+
+        if self._menu_dialog is not None:
+            try:
+                self._menu_dialog.present()
+                return True
+            except Exception:  # pylint: disable=broad-except
+                self._menu_dialog = None
 
         state = {
             "is_connected": self._transport is not None,
@@ -489,7 +525,21 @@ class RemoteExtension(Extension):
             "toggle_braille": self.toggle_braille_mirror,
             "toggle_focus": self.switch_side,
         }
-        build_remote_menu(state, actions)
+        # build_remote_menu destroys the dialog before invoking the
+        # selected action. Hook into the "destroy" signal (fires AFTER
+        # destroy is finished) so our singleton ref is cleared before
+        # the chosen callback runs and can re-enter open_menu.
+        self._menu_dialog = build_remote_menu(state, actions)
+
+        def _clear_menu_ref(_widget: Any) -> None:
+            self._menu_dialog = None
+
+        try:
+            self._menu_dialog.connect("destroy", _clear_menu_ref)
+        except Exception:  # pylint: disable=broad-except
+            # Should never happen on a freshly-built dialog, but if
+            # connect fails for any reason, defensively clear now.
+            self._menu_dialog = None
         return True
 
     def _on_settings_result(self, result: dict[str, Any] | None) -> None:
@@ -499,6 +549,10 @@ class RemoteExtension(Extension):
         dialog. `result` is None on cancel / window-close.
         """
 
+        # Clear singleton ref so the next Orca+Ctrl+R opens a fresh
+        # dialog. settings_dialog.build_settings_dialog destroys the
+        # widget before invoking us, so the ref is guaranteed stale.
+        self._settings_dialog = None
         if result is None:
             return
         changed = False

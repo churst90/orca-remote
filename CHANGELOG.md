@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.6 -- 2026-05-21
+
+Singleton-dialog guard for settings and the remote menu.
+
+- **Bug**: pre-0.5.6, rapid Orca+Ctrl+R presses stacked a fresh
+  Settings (or, in 0.5.4+, Menu) dialog each time — the user had
+  to dismiss N windows one by one. Pre-0.4.1 the dialog was
+  modal-blocking and self-prevented this, but the non-blocking
+  switch in 0.4.1 (so a remote master couldn't lock the GLib
+  loop) lost the guard.
+- **Fix**: `_settings_dialog` and `_menu_dialog` refs on the
+  extension. `open_settings` / `open_menu` check the existing
+  ref and call `.present()` to refocus the live window instead
+  of building a duplicate. Refs are cleared by the dialog's
+  response (settings) or destroy (menu) signal so the next press
+  opens a fresh window.
+
 ## 0.5.5 -- 2026-05-21
 
 Documentation pass. No behavior changes.
