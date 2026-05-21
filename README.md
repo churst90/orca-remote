@@ -1,36 +1,59 @@
 # Orca Remote
 
-NVDA-Remote-compatible remote access for [Orca](https://gitlab.gnome.org/GNOME/orca),
-packaged as a user extension (`.orca-ext`).
+NVDA-Remote-compatible remote access for
+[Orca](https://gitlab.gnome.org/GNOME/orca), packaged as a user
+extension (`.orca-ext`). Bidirectional speech mirroring, host-mode
+key injection (NVDA master → Orca slave), bidirectional clipboard
+sync, and host-mode braille mirroring.
 
-**Current scope:** bidirectional speech mirroring.
+This README covers install, configure, and the menu. Deeper docs:
 
-- **Client role** (default): connect outbound, join a channel as
-  NVDA Remote `master`, and speak any inbound speech locally. Use
-  this to listen to a remote NVDA / Orca machine.
-- **Host role**: connect outbound and join as NVDA Remote `slave`.
-  Whatever your local Orca says is forwarded over the wire to the
-  remote master. Use this when you want a sighted helper (or another
-  Orca user) to hear what your machine is announcing.
+- [docs/architecture.md](docs/architecture.md) — threads, message
+  flow, why the design is the way it is.
+- [docs/wire-protocol.md](docs/wire-protocol.md) — every message
+  type we send/receive, NVDA Remote v2.x compatibility matrix.
+- [docs/troubleshooting.md](docs/troubleshooting.md) — known
+  symptoms (web sluggishness, stuck keys, VM freezes) and their
+  fixes.
 
-The two ends are still asymmetric on the wire (NVDA Remote v2.x
-semantics). To "swap sides" both peers must change role.
+## Feature matrix
 
-**Still not implemented:**
+| Direction              | Speech | Braille | Keys | Clipboard |
+|------------------------|--------|---------|------|-----------|
+| Orca host → NVDA master| YES    | YES (Latin-only) | n/a  | OUT-OK    |
+| Orca host → Orca master| YES    | YES (Latin-only) | n/a  | OUT-OK    |
+| NVDA master → Orca host| n/a    | n/a (log only)   | YES  | IN-OK     |
+| Orca master → Orca host| n/a    | n/a (log only)   | NO   | IN-OK     |
+| Orca master → NVDA host| n/a    | n/a (log only)   | NO   | IN-OK     |
 
-- Key forwarding -- a master can't yet inject keystrokes on the
-  slave. Requires a controller key-synth API in orca-perf.
-- Braille mirroring, clipboard sync, tones.
-- Self-hosted relay docs.
+**YES** = implemented and exercised. **NO** = not yet implemented;
+gap is documented in [docs/architecture.md](docs/architecture.md)
+under "Deferred work."
+
+Notes:
+
+- **Braille mirroring** out from a host uses a US computer braille
+  ASCII→cell table, so English text renders correctly on a master's
+  braille viewer. Non-Latin scripts come through as blank cells.
+- **Master-side key forwarding** (Orca user typing on the Linux
+  master to control a Windows / Linux slave) is the biggest
+  remaining gap. It needs either a new "consume keyboard event"
+  hook on the perf-branch controller or a large set of AT-SPI key
+  grabs. Tracked for a future release.
+- **File transfer** is not in scope — the v2 wire has no
+  file-transfer message, and a custom one would lose NVDA interop.
 
 ## Requirements
 
-- Orca built from `orca-perf` (or a future stock Orca that ships
-  the user-extension framework upstream).
-- Python 3.12 or newer (Stage 1 uses `asyncio` + `ssl` from stdlib;
-  no third-party dependencies).
-- A reachable NVDA Remote v2.x relay. The public default is
-  `nvdaremote.com:6837`.
+- Orca built from `orca-perf` (this is the user's working branch;
+  upstream lacks the `speech_emitted` / `braille_emitted` /
+  `synthesize_key_event` hooks the extension depends on).
+- Python 3.12 or newer. Standard library only (`asyncio` + `ssl`);
+  no third-party dependencies for the extension itself.
+- A reachable NVDA Remote v2.x relay. Public default is
+  `nvdaremote.com:6837`. Self-hosting is straightforward — see
+  [docs/architecture.md](docs/architecture.md) for the wire
+  contract.
 
 ## Install
 
@@ -39,83 +62,148 @@ semantics). To "swap sides" both peers must change role.
 orca --install-extension remote.orca-ext
 ```
 
-The first command builds `remote.orca-ext` from the current directory.
-The second registers it; Orca prompts to enable it on next launch.
+`./build-orca-ext.sh .` reads `manifest.toml` for the output name
+and produces `remote.orca-ext` in the current directory. The
+`orca --install-extension` step registers it; Orca prompts to enable
+it on the next launch.
+
+## The remote menu
+
+The extension binds **Orca + Ctrl + R** to open a state-aware menu.
+Items appear/disappear based on whether you're connected, whether
+you're a host or a client, and the current mirror toggles. The
+menu always has a "Close" button to exit without doing anything.
+
+Items by state:
+
+| Item                           | When shown                       |
+|--------------------------------|----------------------------------|
+| Settings…                      | always                           |
+| Disconnect                     | connected                        |
+| Push clipboard to remote       | connected                        |
+| Mute / Unmute speech mirror    | connected, role = host           |
+| Stop / Resume braille mirror   | connected, role = host           |
+| Mute / Unmute inbound speech   | connected, role = client         |
+| Connect (opens settings)       | not connected                    |
+
+The "Connect" item deliberately opens the settings dialog: on a
+first run you need to configure the relay anyway, and on subsequent
+runs saving settings re-dials.
+
+## Standalone chords (kept for muscle memory)
+
+- **Orca + Ctrl + R** — open the remote menu.
+- **Orca + Ctrl + Page Up** — connect (or settings, if unconfigured).
+- **Orca + Ctrl + Page Down** — disconnect.
+- **Orca + Alt + Tab** — client only; toggle "focus on remote"
+  (mutes inbound speech without dropping the connection).
 
 ## Configure
 
-Once enabled, the keyboard chords are:
+Settings dialog fields (from the "Settings…" menu item, or
+Orca+Ctrl+R → Settings…):
 
-- **Orca + Ctrl + R** -- open the settings dialog.
-- **Orca + Ctrl + Page Up** -- connect.
-- **Orca + Ctrl + Page Down** -- disconnect.
-- **Orca + Alt + Tab** -- toggle master focus between the remote
-  session and your local machine. When focused on remote, you hear
-  the slave's speech; when focused on local, the remote stream is
-  silenced so you can use your own machine normally. Connection
-  stays up either way. Available only in client (master) mode; on
-  the slave end this chord is a silent no-op. Use the settings
-  dialog to change role.
-Fields:
-
-- **Relay host:** default `nvdaremote.com`.
-- **Relay port:** default `6837`.
-- **Channel key:** the shared passphrase agreed on by both peers.
-  This is the same value you type into NVDA Remote's
-  "Connect" dialog on the Windows side.
-- **Server fingerprint (SHA-256):** the SHA-256 of the relay's TLS
-  certificate, lowercase hex. **Required.** See "First connect" below.
+- **Relay host** — default `nvdaremote.com`.
+- **Relay port** — default `6837`.
+- **Channel key** — the shared passphrase agreed on by both peers.
+  This is the same value you type into NVDA Remote's "Connect"
+  dialog on the Windows side.
+- **Server fingerprint (SHA-256)** — the SHA-256 of the relay's
+  TLS certificate, lowercase hex. **Required.** See "First
+  connect" below.
+- **Role** — Client (receive speech / control remote) or Host
+  (broadcast speech, accept inbound keys).
 
 Settings persist to `$XDG_DATA_HOME/orca/orca-remote-settings.json`
-(typically `~/.local/share/orca/orca-remote-settings.json`).
+(typically `~/.local/share/orca/orca-remote-settings.json`). The
+file is created with `0o600` perms — the channel key is a shared
+secret.
 
 ## First connect (fingerprint bootstrap)
 
-Orca Remote pins the relay's certificate by SHA-256 fingerprint --
-there is no CA trust and no first-connect TOFU. On the first
-attempt with an empty fingerprint field, the connection is refused
-and Orca speaks the fingerprint it actually saw. Open the settings
-dialog again (Orca + Ctrl + R), paste that value into "Server
-fingerprint", and save. Subsequent connects will succeed as long
-as the fingerprint still matches.
+Orca Remote pins the relay's certificate by SHA-256 fingerprint —
+no CA trust, no first-connect TOFU. On the first attempt with an
+empty fingerprint field, the connection is refused and Orca speaks
+the fingerprint it actually saw AND copies it to your clipboard.
+Open the menu → Settings…, focus "Server fingerprint", and paste
+with Control + V.
 
 If the relay rotates its certificate later, you'll get the same
-"server fingerprint did not match" announcement -- verify the new
-value out of band, then update the setting.
+"server fingerprint did not match" announcement — verify the new
+value out of band (`openssl s_client` works), then update the
+setting.
 
-You can also fetch the fingerprint ahead of time:
+Pre-fetch the fingerprint from the shell:
 
 ```sh
-openssl s_client -servername nvdaremote.com -connect nvdaremote.com:6837 < /dev/null 2>/dev/null \
+openssl s_client -servername nvdaremote.com -connect nvdaremote.com:6837 \
+    < /dev/null 2>/dev/null \
   | openssl x509 -fingerprint -sha256 -noout \
-  | sed 's/SHA256 Fingerprint=//; s/://g' | tr '[:upper:]' '[:lower:]'
+  | sed 's/SHA256 Fingerprint=//; s/://g' \
+  | tr '[:upper:]' '[:lower:]'
 ```
 
-## How it works
+## Pairing scenarios
 
-- On enable, the extension starts a daemon thread running an
-  `asyncio` event loop.
-- That loop holds one outbound TLS connection to the relay,
-  reconnecting with exponential backoff on failure.
-- After TLS handshake, the extension sends a `protocol_version`
-  frame followed by a `join` frame with `connection_type=master`.
-- Inbound `speak` messages have their text extracted and routed
-  back to Orca's main thread via `GLib.idle_add` -- the actual
-  TTS hand-off uses `controller.present_message_internal`.
+### Linux host, Windows master (NVDA helper)
 
-## Roadmap
+You want a sighted (or screen-reader) helper on Windows to hear
+your Linux Orca and control your machine.
 
-- **Stage 2:** host mode (be controlled), Orca command-key forwarding
-  via `controller.enter_modal_mode`. Requires upstream `speech_emitted`
-  signal so outbound speech can be tapped without monkey-patching.
-- **Stage 3:** braille buffer mirroring, clipboard push, tone/beep
-  forwarding, self-hosted relay docs.
+1. Both peers: agree on a channel key.
+2. Linux: Orca + Ctrl + R → Settings…, set Role = Host, paste
+   relay host/port + channel key + fingerprint, Save.
+3. Windows: open NVDA Remote → "Allow this machine to control
+   another", enter same relay + channel key.
+4. Both peers should hear "connected." The Windows side now hears
+   your Orca speech and sees your braille buffer. Their keystrokes
+   land on your machine.
+
+To temporarily silence the speech mirror without disconnecting:
+Orca + Ctrl + R → "Mute outbound speech mirror".
+
+### Linux master, NVDA host (you control NVDA)
+
+Listen to a remote Windows machine running NVDA. Note that
+master-side key forwarding from Orca isn't implemented yet, so
+this is listen-only.
+
+1. Both peers: agree on a channel key.
+2. Linux: Orca + Ctrl + R → Settings…, set Role = Client, fill
+   relay + channel + fingerprint.
+3. Windows: NVDA Remote → "Control another machine".
+4. You'll hear NVDA's speech locally. To briefly mute the inbound
+   stream while you work on your own machine: Orca + Alt + Tab.
+
+### Two Orca machines
+
+Same as above. The extension wire format is NVDA Remote v2.x for
+compatibility, so two Orca peers work with the public relay or
+any self-hosted v2 relay.
+
+## Testing
+
+Pure-function unit tests covering protocol parsing, VK translation,
+and braille cell mapping:
+
+```sh
+python3 -m pytest tests/
+```
+
+Live wire driver for slave-side key injection smoke tests:
+
+```sh
+python3 tests/fake_master.py <channel> <fingerprint> --type "hello"
+```
+
+See `tests/fake_master.py --help` for options. Requires an actual
+slave-mode Orca on the same channel.
 
 ## License
 
 LGPL-2.1-or-later. See `LICENSE`.
 
 The wire-protocol layout (newline-JSON frames, message vocabulary,
-channel-key join semantics) is compatible with NVDA Remote v2.x but
-the implementation here is a clean-room rewrite; no code is lifted
-from the NVDA Remote project (GPL-2.0).
+channel-key join semantics) is compatible with NVDA Remote v2.x
+but the implementation here is a clean-room rewrite; no code is
+lifted from the NVDA Remote project (GPL-2.0).

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.5 -- 2026-05-21
+
+Documentation pass. No behavior changes.
+
+- README rewritten: feature matrix (host/master × speech/braille/
+  keys/clipboard), pairing scenarios (NVDA-master, Orca-master,
+  two-Orca), menu reference, install + first-connect bootstrap.
+- `docs/architecture.md`: module layout, thread model, message
+  flow, state inventory, why-each-decision rationale, deferred
+  work (master-side keys, inbound braille render, liblouis).
+- `docs/wire-protocol.md`: every message type we send/receive with
+  payload shapes, NVDA Remote v2.x compatibility matrix, key
+  message handling pipeline, fingerprint pin mechanics, framing
+  limits, reconnect backoff.
+- `docs/troubleshooting.md`: every symptom we've hit (web
+  sluggishness, stuck Caps Lock, stuck modifiers, reconnect
+  announce spam, master-chord misfire on slave, double-speak,
+  insecure settings file, fingerprint mismatch, Wayland synth
+  failure, drop counters, outbound congestion) with root cause
+  and the commit that fixed it.
+
 ## 0.5.4 -- 2026-05-21
 
 Remote menu UI. Orca+Ctrl+R now opens a state-aware Gtk dialog
