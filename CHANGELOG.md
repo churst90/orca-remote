@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0 -- 2026-05-20
+
+- Rebind settings dialog from Orca+Shift+M to **Orca+Ctrl+R**.
+- Split connect/disconnect into explicit chords:
+  **Orca+Ctrl+Page Up** connects; **Orca+Ctrl+Page Down** disconnects.
+- Reserve **Orca+Alt+Tab** for switching between host and remote
+  machine (placeholder; lands with Stage 2 host mode).
+- Auto-copy the server fingerprint to the clipboard on a pin mismatch
+  so a screen-reader user can paste it directly into the settings
+  field instead of memorising 64 hex characters.
+- Workaround for the extension loader not registering the synthetic
+  top-level parent (`orca_user_extension`) in sys.modules, which
+  blocked relative imports.
+
 ## 0.1.0 -- 2026-05-20
 
 Initial release. Stage 1 MVP.

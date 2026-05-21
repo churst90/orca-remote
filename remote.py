@@ -13,8 +13,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import threading
+import types
 from typing import Any
+
+# Workaround: orca's extension loader synthesizes the child package
+# (`orca_user_extension.remote`) and registers it in sys.modules, but
+# not the top-level parent `orca_user_extension`. Without that
+# top-level entry, our relative imports below trigger
+# `ModuleNotFoundError: No module named 'orca_user_extension'` because
+# Python's import machinery walks parent names. Create a stub parent
+# package if one isn't already present.
+if "orca_user_extension" not in sys.modules:
+    _parent = types.ModuleType("orca_user_extension")
+    _parent.__path__ = []  # type: ignore[attr-defined]
+    sys.modules["orca_user_extension"] = _parent
 
 import gi
 
@@ -93,24 +107,74 @@ class RemoteExtension(Extension):
 
     # ---- command registration -------------------------------------
     #
-    # Orca+Shift+M opens the settings dialog. We deliberately avoid
-    # Orca+Shift+R (table-row read) and Orca+R (OCR toggle).
+    # Orca+Ctrl+R       open settings dialog
+    # Orca+Ctrl+PageUp  connect (no-op if already connected)
+    # Orca+Ctrl+PageDn  disconnect (no-op if already disconnected)
+    # Orca+Alt+Tab      switch focus between host and remote machine
+    #                    (placeholder until host mode lands in Stage 2)
 
     def _get_commands(self) -> list[Command]:
+        ctrl = keybindings.ORCA_CTRL_MODIFIER_MASK
+        alt = keybindings.ORCA_ALT_MODIFIER_MASK
         return [
             KeyboardCommand(
                 "orcaRemoteOpenSettingsHandler",
                 self.open_settings,
                 self.GROUP_LABEL,
                 "Open Orca Remote settings",
-                desktop_keybinding=keybindings.KeyBinding(
-                    "m", keybindings.ORCA_SHIFT_MODIFIER_MASK,
-                ),
-                laptop_keybinding=keybindings.KeyBinding(
-                    "m", keybindings.ORCA_SHIFT_MODIFIER_MASK,
-                ),
+                desktop_keybinding=keybindings.KeyBinding("r", ctrl),
+                laptop_keybinding=keybindings.KeyBinding("r", ctrl),
+            ),
+            KeyboardCommand(
+                "orcaRemoteConnectHandler",
+                self.connect,
+                self.GROUP_LABEL,
+                "Connect Orca Remote",
+                desktop_keybinding=keybindings.KeyBinding("Page_Up", ctrl),
+                laptop_keybinding=keybindings.KeyBinding("Page_Up", ctrl),
+            ),
+            KeyboardCommand(
+                "orcaRemoteDisconnectHandler",
+                self.disconnect_session,
+                self.GROUP_LABEL,
+                "Disconnect Orca Remote",
+                desktop_keybinding=keybindings.KeyBinding("Page_Down", ctrl),
+                laptop_keybinding=keybindings.KeyBinding("Page_Down", ctrl),
+            ),
+            KeyboardCommand(
+                "orcaRemoteSwitchSideHandler",
+                self.switch_side,
+                self.GROUP_LABEL,
+                "Switch between host and remote machine",
+                desktop_keybinding=keybindings.KeyBinding("Tab", alt),
+                laptop_keybinding=keybindings.KeyBinding("Tab", alt),
             ),
         ]
+
+    def connect(self) -> bool:
+        if self._transport is not None:
+            self._say("Orca Remote already connected.")
+            return True
+        self._say("Orca Remote: connecting.")
+        self._restart_transport()
+        return True
+
+    def disconnect_session(self) -> bool:
+        if self._transport is None:
+            self._say("Orca Remote already disconnected.")
+            return True
+        self._say("Orca Remote: disconnecting.")
+        self._stop_transport()
+        return True
+
+    def switch_side(self) -> bool:
+        # Placeholder until Stage 2 lands host mode. With only client
+        # mode available, there is nothing to switch between.
+        self._say(
+            "Orca Remote: switching between host and remote is not "
+            "yet implemented. This will land with Stage 2 host mode."
+        )
+        return True
 
     def open_settings(self) -> bool:
         """Open the modal settings dialog and apply any changes on OK."""
@@ -283,12 +347,23 @@ class RemoteExtension(Extension):
 
     def _on_fingerprint_mismatch(self, actual: str) -> None:
         # Surface the fingerprint we actually saw so the user can
-        # paste it into the setting if they trust it.
+        # paste it into the setting if they trust it. Also copy it
+        # to the clipboard from the GLib main thread so a blind user
+        # doesn't have to memorise a 64-char hex string.
+        GLib.idle_add(self._copy_fingerprint_idle_cb, actual)
         self._say_async(
             "Orca Remote: server fingerprint did not match. "
-            "Open Settings and set Server fingerprint to: "
-            + actual
+            "The fingerprint has been copied to the clipboard. "
+            "Press Orca+Shift+M, focus the Server fingerprint field, "
+            "and paste with Control+V."
         )
+
+    def _copy_fingerprint_idle_cb(self, actual: str) -> bool:
+        try:
+            self.controller.set_clipboard_text(actual)
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"set_clipboard_text failed: {error}")
+        return False  # one-shot
 
     # ---- helpers ---------------------------------------------------
 
