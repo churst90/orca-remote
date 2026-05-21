@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Editor leftovers
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local test artifacts
+/tmp-*
+remote.orca-ext
