@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.1 -- 2026-05-21
+
+VK coverage expansion in `keymap.py`. 146 VK codes mapped (up from
+the 0.4.x letter+digit+nav+F-key set):
+
+- **Browser keys** (VK 0xA6..0xAC): Back / Forward / Refresh / Stop
+  / Search / Favorites / Home → matching XF86 keysyms.
+- **Media / volume keys** (VK 0xAD..0xB7): Mute / VolUp / VolDown
+  / Next / Prev / Stop / Play-Pause / Mail / MediaSelect / App1
+  / App2 → XF86Audio*, XF86Mail, XF86MyComputer, XF86Calculator.
+- **IME keys** (VK 0x15, 0x17..0x19, 0x1C..0x1F): Hangul/Kana,
+  Junja, Final, Hanja/Kanji, Convert, NonConvert, Accept,
+  ModeChange → XK_Hangul, XK_Kanji, XK_Henkan_Mode, XK_Muhenkan
+  etc. CJK-input users on an NVDA master can now drive the
+  matching ibus / fcitx IME on a Linux slave.
+
 ## 0.5.0 -- 2026-05-21
 
 Flow-control and silent-drop fixes. First wave of a larger Stage-3

@@ -55,7 +55,18 @@ _NAMED: dict[int, int] = {
     0x12: 0xffe9,  # VK_MENU (Alt)  -> XK_Alt_L
     0x13: 0xff13,  # VK_PAUSE       -> XK_Pause
     0x14: 0xffe5,  # VK_CAPITAL     -> XK_Caps_Lock
+    # IME keys. The X server side usually has these bound to
+    # ibus / fcitx triggers; mapping them lets a CJK-input user on a
+    # Windows master drive the matching IME on a Linux slave.
+    0x15: 0xff31,  # VK_HANGUL/KANA -> XK_Hangul / XK_Kanji_Bangou (same)
+    0x17: 0xff39,  # VK_JUNJA       -> XK_Hangul_Jeonja
+    0x18: 0xff37,  # VK_FINAL       -> XK_Codeinput (closest)
+    0x19: 0xff21,  # VK_HANJA/KANJI -> XK_Kanji
     0x1B: 0xff1b,  # VK_ESCAPE      -> XK_Escape
+    0x1C: 0xff26,  # VK_CONVERT     -> XK_Henkan_Mode
+    0x1D: 0xff22,  # VK_NONCONVERT  -> XK_Muhenkan
+    0x1E: 0xff23,  # VK_ACCEPT      -> XK_Henkan
+    0x1F: 0xff24,  # VK_MODECHANGE  -> XK_Romaji
     0x20: 0x0020,  # VK_SPACE       -> XK_space
     # Nav-cluster keys default to the *numpad* keysym (extended=False
     # is what Windows reports when NumLock is off and the user pressed
@@ -92,6 +103,27 @@ _NAMED: dict[int, int] = {
     0xA3: 0xffe4,  # VK_RCONTROL    -> XK_Control_R
     0xA4: 0xffe9,  # VK_LMENU       -> XK_Alt_L
     0xA5: 0xffea,  # VK_RMENU       -> XK_Alt_R
+    # Browser keys (VK 0xA6..0xAC). XF86 keysyms; modern desktops bind
+    # them to the matching application actions.
+    0xA6: 0x1008ff26,  # VK_BROWSER_BACK       -> XF86XK_Back
+    0xA7: 0x1008ff27,  # VK_BROWSER_FORWARD    -> XF86XK_Forward
+    0xA8: 0x1008ff73,  # VK_BROWSER_REFRESH    -> XF86XK_Refresh
+    0xA9: 0x1008ff28,  # VK_BROWSER_STOP       -> XF86XK_Stop
+    0xAA: 0x1008ff1b,  # VK_BROWSER_SEARCH     -> XF86XK_Search
+    0xAB: 0x1008ff30,  # VK_BROWSER_FAVORITES  -> XF86XK_Favorites
+    0xAC: 0x1008ff18,  # VK_BROWSER_HOME       -> XF86XK_HomePage
+    # Volume / media keys (VK 0xAD..0xB7).
+    0xAD: 0x1008ff12,  # VK_VOLUME_MUTE        -> XF86XK_AudioMute
+    0xAE: 0x1008ff11,  # VK_VOLUME_DOWN        -> XF86XK_AudioLowerVolume
+    0xAF: 0x1008ff13,  # VK_VOLUME_UP          -> XF86XK_AudioRaiseVolume
+    0xB0: 0x1008ff17,  # VK_MEDIA_NEXT_TRACK   -> XF86XK_AudioNext
+    0xB1: 0x1008ff16,  # VK_MEDIA_PREV_TRACK   -> XF86XK_AudioPrev
+    0xB2: 0x1008ff15,  # VK_MEDIA_STOP         -> XF86XK_AudioStop
+    0xB3: 0x1008ff14,  # VK_MEDIA_PLAY_PAUSE   -> XF86XK_AudioPlay
+    0xB4: 0x1008ff19,  # VK_LAUNCH_MAIL        -> XF86XK_Mail
+    0xB5: 0x1008ff32,  # VK_LAUNCH_MEDIA_SELECT-> XF86XK_AudioMedia
+    0xB6: 0x1008ff1c,  # VK_LAUNCH_APP1        -> XF86XK_MyComputer
+    0xB7: 0x1008ff5d,  # VK_LAUNCH_APP2        -> XF86XK_Calculator
     0xBA: 0x003b,  # VK_OEM_1       -> XK_semicolon
     0xBB: 0x003d,  # VK_OEM_PLUS    -> XK_equal
     0xBC: 0x002c,  # VK_OEM_COMMA   -> XK_comma
