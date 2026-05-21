@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.3 -- 2026-05-21
+
+Third round of host-mode fixes. Replaces the 0.4.2 tap-detection
+with straight pass-through (per user request: slave behavior
+should follow the slave's own layout, not the master's NVDA
+layout) and adds two new defenses.
+
+- **Locking keys pass through.** Removed the tap-vs-modifier
+  detection added in 0.4.2. Caps Lock / Num Lock / Scroll Lock
+  are now synthesized straight to the X server; a tap toggles
+  the lock state as on any normal keyboard. The slave's caps
+  lock is whatever the user has toggled it to, regardless of
+  which layout NVDA is using on the master. If an NVDA-laptop
+  modifier chord accidentally leaves the slave's caps lock on,
+  one more tap clears it.
+- **Strict autorepeat dedupe.** 0.4.2 dropped duplicate PRESS
+  events only while an Orca modifier was held. User reports
+  that even a single physical Insert+R press still loops the
+  OCR "Recognizing." command, which means NVDA Remote can send
+  duplicate PRESS frames for a single keystroke even without
+  autorepeat. The dedupe now drops ANY PRESS for a keysym
+  already in `_pressed_keysyms`. Cost: held-key autorepeat for
+  typing (e.g. holding 'a' to fill a text field) no longer
+  works over the link; tap each key instead.
+- **Proactive speech interrupt on every inbound PRESS.** Orca's
+  natural interrupt-on-key path (`KeyboardEvent._present`)
+  should also fire on XTest-synthesized events, but under VM
+  AT-SPI load with a backed-up speech-dispatcher queue the
+  interrupt lags noticeably -- Control no longer silences
+  speech, quick-arrow no longer cuts off the previous
+  utterance. We now call `SpeechManager.InterruptSpeech` from
+  the asyncio thread the moment a PRESS arrives, which mirrors
+  the local feel.
+
 ## 0.4.2 -- 2026-05-21
 
 Second round of host-mode safety fixes after the 0.4.1 VM test.

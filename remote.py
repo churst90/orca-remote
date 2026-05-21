@@ -60,20 +60,6 @@ from .transport import RemoteTransport
 _SETTINGS_FILENAME = "orca-remote-settings.json"
 
 
-# Locking keysyms we refuse to synthesize. XTest treats a PRESS of any
-# of these as a TOGGLE of the X server's lock state, and the toggle
-# survives Orca shutdown (it lives in X, not Orca). NVDA Remote
-# forwards Caps Lock as the NVDA-laptop-layout modifier, which would
-# otherwise stick the slave's caps lock on after one press and lock
-# the user out of every alphabetic Orca chord. We just drop the synth;
-# the slave-side user's own modifier remains in effect locally.
-_LOCKING_KEYSYMS: frozenset[int] = frozenset({
-    0xffe5,  # XK_Caps_Lock
-    0xff7f,  # XK_Num_Lock
-    0xff14,  # XK_Scroll_Lock
-})
-
-
 # Modifier keysyms whose press/release we use to recognize when an
 # inbound key sequence is about to complete one of our own command
 # chords. Tracked against `_pressed_keysyms`, which records what we've
@@ -88,9 +74,7 @@ _ALT_KEYSYMS: frozenset[int] = frozenset({0xffe9, 0xffea})
 # Keysyms that, when pressed while Orca-mod + Ctrl are held, would fire
 # one of our own commands (open_settings, connect, disconnect). Refused
 # in host mode so a remote master can't pop our settings dialog or
-# bounce the transport. Caps_Lock is in _LOCKING_KEYSYMS above and
-# never synthesized regardless, so the laptop-layout case is covered
-# even though it doesn't appear here.
+# bounce the transport.
 _OWN_CTRL_CHORD_KEYSYMS: frozenset[int] = frozenset({
     0x72,    # XK_r          -> open_settings
     0xff55,  # XK_Page_Up    -> connect
@@ -140,15 +124,6 @@ class RemoteExtension(Extension):
         # synthetic releases so a force-killed VM is never the only
         # way out of a stuck modifier.
         self._pressed_keysyms: set[int] = set()
-        # Locking-keysym tap-vs-modifier detection. Maps keysym ->
-        # bool "another key was pressed while this lock was held."
-        # On RELEASE we synth a real PRESS+RELEASE toggle iff False
-        # (i.e. it was a standalone tap, not modifier-style usage).
-        # NVDA-laptop-layout users press Caps Lock as the NVDA modifier
-        # constantly; without this we'd toggle the slave's X caps lock
-        # every chord. NVDA-desktop and DOS-style users tap Caps Lock
-        # to actually toggle, and they get the toggle they expect.
-        self._lock_press_pending: dict[int, bool] = {}
         # Set True the first time we see channel_joined for the current
         # session intent; reset by explicit connect / disconnect /
         # disable so user-initiated transitions re-announce but silent
@@ -522,9 +497,6 @@ class RemoteExtension(Extension):
         # went down. Idle-scheduled so it runs on the GLib thread that
         # owns AT-SPI synthesis.
         self._release_held_keys()
-        # Any deferred lock-key press whose RELEASE never arrived is
-        # no longer interpretable; drop the state.
-        self._lock_press_pending.clear()
 
     # ---- callbacks (run on asyncio thread) ------------------------
 
@@ -592,46 +564,33 @@ class RemoteExtension(Extension):
             )
             return
 
-        if keysym in _LOCKING_KEYSYMS:
-            # Tap-vs-modifier detection. See _lock_press_pending docs.
-            # On PRESS we defer; on RELEASE we synth a PRESS+RELEASE
-            # toggle iff no other key was pressed in between.
-            if pressed:
-                self._lock_press_pending[keysym] = False
-            else:
-                other_seen = self._lock_press_pending.pop(keysym, None)
-                if other_seen is False:
-                    GLib.idle_add(
-                        self._synthesize_key_idle_cb, keysym, True,
-                    )
-                    GLib.idle_add(
-                        self._synthesize_key_idle_cb, keysym, False,
-                    )
-                # other_seen True  -> modifier-style use, drop both events.
-                # other_seen None  -> stray release with no matching press, drop.
-            return
-
-        # Any non-locking PRESS while a lock is pending disqualifies
-        # that lock from being treated as a tap on its RELEASE.
-        if pressed and self._lock_press_pending:
-            for held_lock in self._lock_press_pending:
-                self._lock_press_pending[held_lock] = True
+        # Proactive speech interrupt on every PRESS. Orca's natural
+        # interrupt-on-key path (input_event.KeyboardEvent._present)
+        # should also fire when XTest delivers the synthesized event,
+        # but in practice -- especially under VM AT-SPI load with a
+        # backed-up speech-dispatcher queue -- the natural interrupt
+        # arrives too late and the user hears the previous utterance
+        # finish. Issuing the controller-side interrupt directly when
+        # the key arrives at the asyncio thread makes Control-to-
+        # silence and quick-arrow-to-interrupt feel like local Orca.
+        if pressed:
+            GLib.idle_add(self._interrupt_speech_idle_cb)
 
         GLib.idle_add(self._synthesize_key_idle_cb, keysym, pressed)
 
     def _synthesize_key_idle_cb(self, keysym: int, pressed: bool) -> bool:
-        # Suppress autorepeat for chord commands. NVDA Remote forwards
-        # OS-level key autorepeat as a stream of PRESS frames; without
-        # this, holding Insert+R rapid-fires the OCR command and the
-        # slave loops "Recognizing." until release. Mirrors NVDA's
-        # default no-autorepeat-on-modifier-chord behavior. Plain-key
-        # autorepeat (for typing, terminal scroll, etc.) is unaffected
-        # because no Orca modifier is held.
-        if (
-            pressed
-            and keysym in self._pressed_keysyms
-            and (self._pressed_keysyms & _ORCA_MOD_KEYSYMS)
-        ):
+        # Suppress duplicate PRESS events. NVDA Remote forwards
+        # OS-level autorepeat as a stream of PRESS frames -- and the
+        # user reports that even a SINGLE physical press can arrive
+        # as multiple frames on the wire. Without this, every duplicate
+        # frame fires the bound Orca command again ("Recognizing."
+        # looping on a single Insert+R tap). Dropping any PRESS for a
+        # keysym we already have in _pressed_keysyms (i.e. we have
+        # synthesized a PRESS we haven't yet RELEASED) collapses all
+        # of those down to one event. The cost: key autorepeat for
+        # typing-style use (holding 'a' to fill a text field) is gone
+        # over the link -- the user taps for each character. Worth it.
+        if pressed and keysym in self._pressed_keysyms:
             return False
 
         # Refuse chords that would fire our own commands. Without this,
@@ -656,17 +615,28 @@ class RemoteExtension(Extension):
             self._log("controller has no synthesize_key_event (older Orca?)")
         except Exception as error:  # pylint: disable=broad-except
             self._log(f"synthesize_key_event raised: {error}")
-        if ok and keysym not in _LOCKING_KEYSYMS:
+        if ok:
             # Track press/release pairing so a dropped connection mid-pair
-            # can't leak a held key into the X server. Locking keysyms
-            # arrive as self-contained PRESS+RELEASE toggle pairs (see
-            # _handle_inbound_key); there is no remote-master release
-            # coming that would pop them from this set, so we don't add
-            # them here.
+            # can't leak a held key into the X server, and so the dedupe
+            # check above can spot duplicate frames. Locking keysyms
+            # (Caps_Lock / Num_Lock / Scroll_Lock) are also tracked
+            # because a stuck PRESS without a RELEASE would otherwise
+            # let a future duplicate PRESS through, double-toggling X.
             if pressed:
                 self._pressed_keysyms.add(keysym)
             else:
                 self._pressed_keysyms.discard(keysym)
+        return False  # one-shot
+
+    def _interrupt_speech_idle_cb(self) -> bool:
+        """Cancel any in-progress Orca speech on the GLib main thread."""
+
+        try:
+            self.controller.execute_command_internal(
+                "SpeechManager", "InterruptSpeech", notify_user=False,
+            )
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"InterruptSpeech failed: {error}")
         return False  # one-shot
 
     def _chord_matches_own_command(self, keysym: int) -> bool:
