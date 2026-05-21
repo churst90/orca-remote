@@ -89,6 +89,7 @@ class RemoteTransport:
         port: int,
         channel: str,
         fingerprint: str,
+        connection_type: str,
         on_message: Callable[[dict], Awaitable[None]],
         on_status: Callable[[str], None] | None = None,
         on_fingerprint_mismatch: Callable[[str], None] | None = None,
@@ -97,6 +98,7 @@ class RemoteTransport:
         self._port = port
         self._channel = channel
         self._expected_fp = _normalize_fingerprint(fingerprint)
+        self._connection_type = connection_type
         self._on_message = on_message
         self._on_status = on_status or (lambda _msg: None)
         self._on_fp_mismatch = on_fingerprint_mismatch or (lambda _actual: None)
@@ -202,9 +204,12 @@ class RemoteTransport:
         self._on_status("connected; joining channel")
 
         # Handshake: announce protocol version, then join the channel
-        # as master (we receive speech from the remote slave).
+        # in whichever role the caller configured (master = receive
+        # speech from the remote slave; slave = broadcast our speech).
         writer.write(protocol.encode(protocol.build_protocol_version()))
-        writer.write(protocol.encode(protocol.build_join(self._channel)))
+        writer.write(protocol.encode(
+            protocol.build_join(self._channel, self._connection_type)
+        ))
         await writer.drain()
 
         # Read loop. Each iteration consumes exactly one

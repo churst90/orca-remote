@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 -- 2026-05-20
+
+Stage 2 (Phase 1): host mode lands.
+
+- New **Role** setting: "Receive speech (control a remote machine)"
+  or "Broadcast speech (let a remote machine control us)".
+- In host mode, the extension subscribes to the
+  `speech_emitted` signal on the controller (perf-branch addition)
+  and forwards every utterance to the relay as an NVDA-Remote
+  `speak` message. No monkey-patching of the speech server.
+- Inbound `speak` messages are now ignored when we're in host mode
+  (prevents feedback if both peers somehow broadcast).
+- **Orca + Alt + Tab** is no longer a placeholder: in client mode
+  it toggles master focus between the remote session and the local
+  machine. Focused-on-local mutes the inbound speech stream without
+  dropping the connection; useful when a helper wants to use their
+  own machine briefly. No-op in host mode (the slave has no remote
+  session to focus away from); role changes happen in the settings
+  dialog.
+- Channel-joined announcement is role-aware
+  ("connected" vs "connected in host mode").
+- README rewritten for bidirectional scope.
+
 ## 0.2.0 -- 2026-05-20
 
 - Rebind settings dialog from Orca+Shift+M to **Orca+Ctrl+R**.

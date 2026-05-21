@@ -3,24 +3,25 @@
 NVDA-Remote-compatible remote access for [Orca](https://gitlab.gnome.org/GNOME/orca),
 packaged as a user extension (`.orca-ext`).
 
-**Stage 1 scope (this release):** client-only receive-speech mirror.
-Connect outbound to an NVDA Remote v2.x relay (e.g. `nvdaremote.com`),
-join a channel by shared key, and speak any inbound speech locally
-through Orca. This is enough to pair a Linux/Orca machine with a
-Windows/NVDA machine that has the NVDA Remote add-on installed --
-the Windows side broadcasts its speech as the "slave", and your
-Linux Orca speaks it as the "master".
+**Current scope:** bidirectional speech mirroring.
 
-**Not in Stage 1:**
+- **Client role** (default): connect outbound, join a channel as
+  NVDA Remote `master`, and speak any inbound speech locally. Use
+  this to listen to a remote NVDA / Orca machine.
+- **Host role**: connect outbound and join as NVDA Remote `slave`.
+  Whatever your local Orca says is forwarded over the wire to the
+  remote master. Use this when you want a sighted helper (or another
+  Orca user) to hear what your machine is announcing.
 
-- Host (be-controlled) mode -- you can't yet *be* the slave.
-- Key forwarding -- you can't yet drive the remote machine from
-  your local Orca.
+The two ends are still asymmetric on the wire (NVDA Remote v2.x
+semantics). To "swap sides" both peers must change role.
+
+**Still not implemented:**
+
+- Key forwarding -- a master can't yet inject keystrokes on the
+  slave. Requires a controller key-synth API in orca-perf.
 - Braille mirroring, clipboard sync, tones.
-- Self-hosted relay docs (works fine against any NVDA Remote v2.x
-  relay; just not documented here yet).
-
-Stages 2 and 3 will fill these in.
+- Self-hosted relay docs.
 
 ## Requirements
 
@@ -48,8 +49,13 @@ Once enabled, the keyboard chords are:
 - **Orca + Ctrl + R** -- open the settings dialog.
 - **Orca + Ctrl + Page Up** -- connect.
 - **Orca + Ctrl + Page Down** -- disconnect.
-- **Orca + Alt + Tab** -- switch focus between the host and the
-  remote machine (placeholder until Stage 2 lands host mode).
+- **Orca + Alt + Tab** -- toggle master focus between the remote
+  session and your local machine. When focused on remote, you hear
+  the slave's speech; when focused on local, the remote stream is
+  silenced so you can use your own machine normally. Connection
+  stays up either way. Available only in client (master) mode; on
+  the slave end this chord is a silent no-op. Use the settings
+  dialog to change role.
 Fields:
 
 - **Relay host:** default `nvdaremote.com`.

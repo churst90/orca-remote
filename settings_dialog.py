@@ -28,8 +28,13 @@ SETTING_CHANNEL = "channel"
 SETTING_FINGERPRINT = "fingerprint"
 SETTING_ROLE = "role"
 
-ROLE_CLIENT = "client"  # Stage 1: receive speech only
-ROLE_HOST = "host"      # Stage 2+: be controlled
+ROLE_CLIENT = "client"  # Receive speech from a remote (we are master).
+ROLE_HOST = "host"      # Broadcast our speech (we are slave/host).
+
+_ROLE_LABELS: list[tuple[str, str]] = [
+    (ROLE_CLIENT, "Receive speech (control a remote machine)"),
+    (ROLE_HOST,   "Broadcast speech (let a remote machine control us)"),
+]
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -90,6 +95,9 @@ def build_settings_dialog(initial: dict[str, Any]) -> dict[str, Any] | None:
         grid, 3, "Server fingerprint (SHA-256):",
         str(initial.get(SETTING_FINGERPRINT, "")),
     )
+    role_combo = _add_role_row(
+        grid, 4, "Role:", str(initial.get(SETTING_ROLE, ROLE_CLIENT)),
+    )
 
     dialog.show_all()
     response = dialog.run()
@@ -103,12 +111,16 @@ def build_settings_dialog(initial: dict[str, Any]) -> dict[str, Any] | None:
     except ValueError:
         port_value = int(initial.get(SETTING_PORT, DEFAULT_SETTINGS[SETTING_PORT]))
 
+    role_id = role_combo.get_active_id() or ROLE_CLIENT
+    if role_id not in (ROLE_CLIENT, ROLE_HOST):
+        role_id = ROLE_CLIENT
+
     result: dict[str, Any] = {
         SETTING_HOST: host_entry.get_text().strip() or DEFAULT_SETTINGS[SETTING_HOST],
         SETTING_PORT: port_value,
         SETTING_CHANNEL: channel_entry.get_text(),
         SETTING_FINGERPRINT: fingerprint_entry.get_text().strip(),
-        SETTING_ROLE: ROLE_CLIENT,
+        SETTING_ROLE: role_id,
     }
     dialog.destroy()
     return result
@@ -138,3 +150,28 @@ def _add_text_row(
 
     label.set_mnemonic_widget(entry)
     return entry
+
+
+def _add_role_row(
+    grid: Gtk.Grid,
+    row: int,
+    label_text: str,
+    initial_value: str,
+) -> Gtk.ComboBoxText:
+    """Add a label + role ComboBoxText row, return the combo."""
+
+    label = Gtk.Label(label=label_text, xalign=0.0)
+    label.set_hexpand(False)
+    grid.attach(label, 0, row, 1, 1)
+
+    combo = Gtk.ComboBoxText()
+    for role_id, role_label in _ROLE_LABELS:
+        combo.append(role_id, role_label)
+    if initial_value not in (ROLE_CLIENT, ROLE_HOST):
+        initial_value = ROLE_CLIENT
+    combo.set_active_id(initial_value)
+    combo.set_hexpand(True)
+    grid.attach(combo, 1, row, 1, 1)
+
+    label.set_mnemonic_widget(combo)
+    return combo

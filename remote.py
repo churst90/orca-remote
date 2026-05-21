@@ -42,12 +42,16 @@ from orca.extension import Extension  # noqa: E402
 from . import protocol
 from .settings_dialog import (
     DEFAULT_SETTINGS,
+    ROLE_CLIENT,
+    ROLE_HOST,
     SETTING_CHANNEL,
     SETTING_FINGERPRINT,
     SETTING_HOST,
     SETTING_PORT,
+    SETTING_ROLE,
     build_settings_dialog,
 )
+from .protocol import CONNECTION_TYPE_MASTER, CONNECTION_TYPE_SLAVE
 from .transport import RemoteTransport
 
 
@@ -76,6 +80,13 @@ class RemoteExtension(Extension):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._transport: RemoteTransport | None = None
+        # Master-only "focus" flag: when True, inbound speak messages
+        # from the slave are spoken locally; when False, they are
+        # dropped so the master can use their own machine without the
+        # remote stream chattering over the top. Toggled by
+        # Orca+Alt+Tab. Has no effect when we're the host (a slave
+        # never receives speak messages it needs to mute).
+        self._focus_on_remote: bool = True
         super().__init__()
 
     # ---- lifecycle -------------------------------------------------
@@ -96,14 +107,61 @@ class RemoteExtension(Extension):
         self._log("starting transport")
         self._start_loop_thread()
         self._restart_transport()
+        # Temporary diagnostic: subscribe to the new speech_emitted
+        # signal so we can verify it fires with sensible payloads.
+        # Logs every outbound utterance at INFO. Remove once Stage 2
+        # host mode actually forwards these on the wire.
+        try:
+            self.controller.subscribe_speech_emitted(self._on_speech_emitted)
+            self._log("subscribed to speech_emitted")
+        except AttributeError:
+            self._log("controller has no subscribe_speech_emitted (older Orca?)")
 
     def disable(self) -> None:
         """Stop the transport, then deregister commands."""
 
         self._log("disabling")
+        try:
+            self.controller.unsubscribe_speech_emitted(self._on_speech_emitted)
+        except AttributeError:
+            pass
         self._stop_transport()
         self._stop_loop_thread()
         super().disable()
+
+    def _on_speech_emitted(self, text: str, voice_type: str, language: str) -> None:
+        """Forward Orca's outbound speech to the remote master when in host mode.
+
+        Called from whatever thread SpeechServer.speak() ran on
+        (typically the GLib main thread). Marshals the actual send
+        onto the asyncio loop where the transport lives.
+        """
+
+        # No-op unless we're a host and the transport is live.
+        if self._current_role() != ROLE_HOST:
+            return
+        if self._transport is None or self._loop is None:
+            return
+        if not text:
+            return
+
+        # NVDA Remote's speak message: {"type":"speak","sequence":[...]}
+        # where sequence entries are either strings (text) or dicts
+        # (speech commands). For Stage 2 we forward a single text
+        # fragment; richer ACSS / index marks can come later.
+        message = {"type": protocol.MSG_SPEAK, "sequence": [text]}
+        transport = self._transport
+
+        async def _send() -> None:
+            await transport.send(message)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), self._loop)
+        except RuntimeError:
+            # Loop was closed between the check and the schedule.
+            # Drop the utterance silently; it's only worth logging at
+            # debug level.
+            pass
 
     # ---- command registration -------------------------------------
     #
@@ -168,12 +226,25 @@ class RemoteExtension(Extension):
         return True
 
     def switch_side(self) -> bool:
-        # Placeholder until Stage 2 lands host mode. With only client
-        # mode available, there is nothing to switch between.
-        self._say(
-            "Orca Remote: switching between host and remote is not "
-            "yet implemented. This will land with Stage 2 host mode."
-        )
+        """Toggle the master's focus between remote and local.
+
+        Client (master) only. While focused on remote, inbound
+        speech is spoken; while focused on local, it is dropped so
+        the master can use their own machine without the remote
+        stream chattering over the top. Connection stays up either
+        way. On the slave (host), this is a silent no-op -- matching
+        how NVDA Remote ignores F11-equivalents on the controlled
+        machine.
+        """
+
+        if self._current_role() != ROLE_CLIENT:
+            return True  # slave: silent no-op
+
+        self._focus_on_remote = not self._focus_on_remote
+        if self._focus_on_remote:
+            self._say("Orca Remote: focused on remote machine.")
+        else:
+            self._say("Orca Remote: focused on local machine.")
         return True
 
     def open_settings(self) -> bool:
@@ -202,9 +273,13 @@ class RemoteExtension(Extension):
             return
         self._settings[key] = value
         self._save_settings()
-        # Reconnect if the change affects the transport. Stage 1
-        # treats all four primary settings as connect-affecting.
-        if key in (SETTING_HOST, SETTING_PORT, SETTING_CHANNEL, SETTING_FINGERPRINT):
+        # Reconnect if the change affects the transport. Role is
+        # connect-affecting because the join message's connection_type
+        # changes (master vs slave).
+        if key in (
+            SETTING_HOST, SETTING_PORT, SETTING_CHANNEL,
+            SETTING_FINGERPRINT, SETTING_ROLE,
+        ):
             if not self._disabled:
                 self._restart_transport()
 
@@ -284,6 +359,10 @@ class RemoteExtension(Extension):
         host = str(self._settings.get(SETTING_HOST, "") or "")
         port = int(self._settings.get(SETTING_PORT, 0) or 0)
         fingerprint = str(self._settings.get(SETTING_FINGERPRINT, "") or "")
+        role = str(self._settings.get(SETTING_ROLE, ROLE_CLIENT) or ROLE_CLIENT)
+        connection_type = (
+            CONNECTION_TYPE_SLAVE if role == ROLE_HOST else CONNECTION_TYPE_MASTER
+        )
 
         # Stop existing transport (if any) before starting a new one.
         # Done in the loop thread so we don't race with its read loop.
@@ -299,6 +378,7 @@ class RemoteExtension(Extension):
                 port=port,
                 channel=channel,
                 fingerprint=fingerprint,
+                connection_type=connection_type,
                 on_message=self._on_message,
                 on_status=self._on_status,
                 on_fingerprint_mismatch=self._on_fingerprint_mismatch,
@@ -328,11 +408,23 @@ class RemoteExtension(Extension):
     async def _on_message(self, message: dict) -> None:
         msg_type = message.get("type")
         if msg_type == protocol.MSG_SPEAK:
-            text = protocol.extract_speech_text(message)
-            if text:
-                self._say_async(text)
+            # Only speak inbound utterances when we're a client AND
+            # the master is currently focused on the remote session.
+            # Toggling focus to local (Orca+Alt+Tab) silences the
+            # remote stream without dropping the connection.
+            if (
+                self._current_role() == ROLE_CLIENT
+                and self._focus_on_remote
+            ):
+                text = protocol.extract_speech_text(message)
+                if text:
+                    self._say_async(text)
         elif msg_type == protocol.MSG_CHANNEL_JOINED:
-            self._say_async("Orca Remote connected.")
+            role = self._current_role()
+            if role == ROLE_HOST:
+                self._say_async("Orca Remote connected in host mode.")
+            else:
+                self._say_async("Orca Remote connected.")
         elif msg_type == protocol.MSG_CLIENT_LEFT:
             self._say_async("Orca Remote: peer left.")
         elif msg_type == protocol.MSG_MOTD:
@@ -341,6 +433,10 @@ class RemoteExtension(Extension):
                 self._log(f"motd: {motd}")
         else:
             self._log(f"unhandled message type: {msg_type}")
+
+    def _current_role(self) -> str:
+        role = str(self._settings.get(SETTING_ROLE, ROLE_CLIENT) or ROLE_CLIENT)
+        return role if role in (ROLE_CLIENT, ROLE_HOST) else ROLE_CLIENT
 
     def _on_status(self, status: str) -> None:
         self._log(f"transport: {status}")
