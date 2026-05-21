@@ -611,8 +611,57 @@ class RemoteExtension(Extension):
                 self._log(f"motd: {motd}")
         elif msg_type == protocol.MSG_KEY:
             await self._handle_inbound_key(message)
+        elif msg_type == protocol.MSG_SET_CLIPBOARD_TEXT:
+            text = str(message.get("text", "") or "")
+            if text:
+                GLib.idle_add(self._set_clipboard_idle_cb, text)
         else:
             self._log(f"unhandled message type: {msg_type}")
+
+    def push_clipboard(self) -> bool:
+        """Send the local clipboard text to the peer as set_clipboard_text.
+
+        Reads the local clipboard via the controller (GLib main
+        thread), then schedules the wire send. No-op (with spoken
+        feedback) if the transport is down or the clipboard is empty.
+        Wired to the remote menu in Phase 6; safe to call directly
+        too.
+        """
+
+        if self._transport is None:
+            self._say("Orca Remote: not connected; clipboard not pushed.")
+            return True
+        try:
+            text = str(self.controller.get_clipboard_text() or "")
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"get_clipboard_text failed: {error}")
+            self._say("Orca Remote: could not read clipboard.")
+            return True
+        if not text:
+            self._say("Orca Remote: clipboard is empty.")
+            return True
+        self._schedule_send(
+            {"type": protocol.MSG_SET_CLIPBOARD_TEXT, "text": text},
+            what="clipboard",
+        )
+        # Spoken confirmation that includes the length so the user
+        # has some feedback that something happened. We avoid speaking
+        # the text itself; could be sensitive (passwords, etc.).
+        self._say(f"Orca Remote: pushed clipboard ({len(text)} characters).")
+        return True
+
+    def _set_clipboard_idle_cb(self, text: str) -> bool:
+        """Apply an inbound clipboard text on the GLib main thread."""
+
+        try:
+            self.controller.set_clipboard_text(text)
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"set_clipboard_text failed: {error}")
+            return False
+        # Brief spoken cue so the user knows the peer pushed something.
+        # Length only -- the text itself could be a password.
+        self._say(f"Orca Remote: peer pushed clipboard ({len(text)} characters).")
+        return False  # one-shot
 
     async def _handle_inbound_key(self, message: dict) -> None:
         """Synthesize a remote keystroke on the slave side.

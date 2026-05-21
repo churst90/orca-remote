@@ -43,6 +43,9 @@ MSG_CANCEL = "cancel"
 MSG_PAUSE_SPEECH = "pause_speech"
 MSG_NVDA_NOT_CONNECTED = "nvda_not_connected"
 MSG_KEY = "key"
+MSG_SET_CLIPBOARD_TEXT = "set_clipboard_text"
+MSG_SET_BRAILLE_INFO = "set_braille_info"
+MSG_DISPLAY = "display"
 
 
 # Connection type sent in the join message. "master" = we are the

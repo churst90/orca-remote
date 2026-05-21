@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.2 -- 2026-05-21
+
+Bidirectional clipboard sync.
+
+- **Inbound `set_clipboard_text`**: a peer's clipboard push lands in
+  the local X clipboard via `controller.set_clipboard_text`. A brief
+  spoken cue announces "peer pushed clipboard (N characters)" -- we
+  speak length only, never the content (could be a password).
+- **Outbound `push_clipboard()` method**: reads the local clipboard
+  via `controller.get_clipboard_text`, sends as `set_clipboard_text`.
+  Spoken confirmation with length. Wired to the remote menu in
+  Phase 6; safe to call directly meanwhile.
+- New protocol constants: `MSG_SET_CLIPBOARD_TEXT`,
+  `MSG_SET_BRAILLE_INFO`, `MSG_DISPLAY` (latter two land in 0.5.3
+  when braille mirroring arrives).
+
 ## 0.5.1 -- 2026-05-21
 
 VK coverage expansion in `keymap.py`. 146 VK codes mapped (up from
