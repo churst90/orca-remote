@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.1 -- 2026-05-21
+
+Inbound braille rendering (master side).
+
+Requires perf-branch commit `ad003eeae` (display_braille_text +
+cursor in display_message). On older Orca the AttributeError is
+caught once, logged, and inbound braille silently no-ops.
+
+- **MSG_DISPLAY handler**: decodes the peer's cell bytes as
+  Unicode braille block characters (U+2800 + cell_byte) and
+  pushes via `controller.display_braille_text`. Unicode braille
+  passthrough is the standard interpretation; the local BrlAPI
+  driver renders exactly the dot pattern the peer intended,
+  regardless of whether the peer ran orca-remote or NVDA Remote.
+- **MSG_SET_BRAILLE_INFO handler**: tracks peer's `numCells` in
+  `_peer_braille_cells` for informational use.
+- **Focus-aware gating**: inbound braille only renders when
+  role=client AND `_focus_on_remote=True`. Same toggle that mutes
+  inbound speech (Orca+Alt+Tab) now mutes inbound braille for
+  consistency.
+- **No spoken feedback per frame**: would be too noisy. Failures
+  are logged once at debug; subsequent frames silent.
+
 ## 0.6.0 -- 2026-05-21
 
 Master-side key forwarding (Linux Orca master -> NVDA / Orca slave).

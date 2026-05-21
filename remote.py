@@ -153,6 +153,10 @@ class RemoteExtension(Extension):
         # Same idea for braille: a long-running line refresh produces
         # many braille_emitted with identical text+cursor; drop repeats.
         self._last_outbound_braille: tuple[str, int] = ("", -2)
+        # Peer-reported braille display width. Set from inbound
+        # set_braille_info; informational for now (display_braille_text
+        # auto-sizes to our local display, not the peer's).
+        self._peer_braille_cells: int = 0
         # Set True on the first set_braille_info we send per session
         # so we re-send the dimensions only when the master would have
         # forgotten (a fresh channel_joined). Reset on disconnect.
@@ -887,19 +891,41 @@ class RemoteExtension(Extension):
             if text:
                 GLib.idle_add(self._set_clipboard_idle_cb, text)
         elif msg_type == protocol.MSG_SET_BRAILLE_INFO:
-            # Peer told us their braille display dimensions. We don't
-            # currently render inbound braille (needs another perf-
-            # branch hook to push to local BrlAPI), so just log.
-            num_cells = message.get("numCells", "?")
-            name = message.get("name", "?")
+            # Track peer's display dimensions so we can resize our
+            # local render if/when the host machine swaps displays
+            # mid-session.
+            try:
+                num_cells = int(message.get("numCells", 0) or 0)
+            except (TypeError, ValueError):
+                num_cells = 0
+            name = str(message.get("name", "") or "")
+            self._peer_braille_cells = num_cells
             self._log(f"peer braille info: name={name!r} cells={num_cells}")
         elif msg_type == protocol.MSG_DISPLAY:
-            # Inbound braille from the peer. Same story: no renderer
-            # yet. Log cell count at debug only; full text-from-cells
-            # reverse decode is future work.
-            cells = message.get("cells") or []
-            if isinstance(cells, list):
-                self._log(f"inbound braille frame: {len(cells)} cell(s)")
+            # Inbound braille from the peer. We render cells as the
+            # equivalent Unicode braille block characters (U+2800 +
+            # cell_byte) and push via controller.display_braille_text.
+            # Unicode braille passthrough is the standard
+            # interpretation; the local BrlAPI driver will produce
+            # exactly the dot pattern the peer intended.
+            #
+            # Client mode only, and only while the master is
+            # "focused on remote" (_focus_on_remote) -- the same
+            # toggle that mutes inbound speech also mutes inbound
+            # braille for consistency.
+            if (
+                self._current_role() == ROLE_CLIENT
+                and self._focus_on_remote
+            ):
+                cells = message.get("cells") or []
+                if isinstance(cells, list) and cells:
+                    text = "".join(
+                        chr(0x2800 + (int(c) & 0xff))
+                        for c in cells
+                        if isinstance(c, int)
+                    )
+                    if text:
+                        GLib.idle_add(self._render_inbound_braille_idle_cb, text)
         else:
             self._log(f"unhandled message type: {msg_type}")
 
@@ -962,6 +988,32 @@ class RemoteExtension(Extension):
         # the text itself; could be sensitive (passwords, etc.).
         self._say(f"Orca Remote: pushed clipboard ({len(text)} characters).")
         return True
+
+    def _render_inbound_braille_idle_cb(self, text: str) -> bool:
+        """Apply an inbound braille frame to the local display.
+
+        Runs on the GLib main thread (display_braille_text touches
+        BrlAPI state). If the call fails for any reason -- no local
+        braille display attached, BrlAPI session dead, older Orca
+        without the controller hook -- it's logged once at debug
+        level and we move on. No spoken feedback (would be too
+        noisy on every frame).
+        """
+
+        try:
+            self.controller.display_braille_text(text)
+        except AttributeError:
+            # Older Orca without the hook. Surface once so the user
+            # knows; subsequent failures just no-op via the flag.
+            if not getattr(self, "_warned_no_braille_render", False):
+                self._log(
+                    "controller has no display_braille_text (older Orca?); "
+                    "inbound braille rendering unavailable"
+                )
+                self._warned_no_braille_render = True
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"display_braille_text failed: {error}")
+        return False  # one-shot
 
     def _set_clipboard_idle_cb(self, text: str) -> bool:
         """Apply an inbound clipboard text on the GLib main thread."""

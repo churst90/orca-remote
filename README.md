@@ -18,13 +18,13 @@ This README covers install, configure, and the menu. Deeper docs:
 
 ## Feature matrix
 
-| Direction              | Speech | Braille | Keys | Clipboard |
-|------------------------|--------|---------|------|-----------|
-| Orca host → NVDA master| YES    | YES (Latin-only) | n/a  | OUT-OK    |
-| Orca host → Orca master| YES    | YES (Latin-only) | n/a  | OUT-OK    |
-| NVDA master → Orca host| n/a    | n/a (log only)   | YES  | IN-OK     |
-| Orca master → Orca host| n/a    | n/a (log only)   | PARTIAL | IN-OK  |
-| Orca master → NVDA host| n/a    | n/a (log only)   | PARTIAL | IN-OK  |
+| Direction              | Speech | Braille          | Keys    | Clipboard |
+|------------------------|--------|------------------|---------|-----------|
+| Orca host → NVDA master| YES    | YES (Latin-only) | n/a     | OUT-OK    |
+| Orca host → Orca master| YES    | YES (Latin-only) | n/a     | OUT-OK    |
+| NVDA master → Orca host| n/a    | n/a              | YES     | IN-OK     |
+| Orca master → Orca host| n/a    | YES (inbound)    | PARTIAL | IN-OK     |
+| Orca master → NVDA host| n/a    | YES (inbound)    | PARTIAL | IN-OK     |
 
 **YES** = implemented and exercised. **NO** = not yet implemented;
 gap is documented in [docs/architecture.md](docs/architecture.md)
