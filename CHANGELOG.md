@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.3 -- 2026-05-21
+
+Host-mode braille mirroring (outbound).
+
+Requires perf-branch commits `d846b2a70` (synthesize_key_event
+promoted to a real commit) and `9c98efe6a` (braille_emitted hook).
+On older Orca builds the extension catches the AttributeError on
+subscribe and silently disables braille mirroring.
+
+- **`braille_table.py`**: US computer braille ASCII→cell table
+  plus a Unicode-braille-block passthrough. Lossy for non-Latin
+  scripts but legible for English (the practical Orca-host →
+  NVDA-master case). Liblouis-backed translation is a future
+  swap-out behind the same `text_to_cells` interface.
+- **`_on_braille_emitted`**: subscribes to the perf-branch hook;
+  translates the rendered braille text to cells; sends NVDA Remote
+  v2 `display` frames. `set_braille_info` is sent once per session
+  on the first frame with the cell count so the master's braille
+  viewer knows the dimensions.
+- **Frame dedup**: braille_emitted fires on every paint including
+  no-op refreshes. Identical (text, cursor_cell) frames are
+  dropped before the wire.
+- **Inbound `display` / `set_braille_info`**: logged only. Rendering
+  arbitrary braille onto a local BrlAPI display from a master
+  needs another perf-branch hook (push-from-extension) that hasn't
+  landed yet; for now the Orca-master direction is listen-only on
+  braille.
+- **Menu toggle methods**: `toggle_speech_mirror()` and
+  `toggle_braille_mirror()` are public on the extension instance
+  so the remote menu (Phase 6) can wire them up. Both speak status
+  on toggle and reset their dedup sentinels so a re-enable doesn't
+  swallow a fresh first frame.
+
 ## 0.5.2 -- 2026-05-21
 
 Bidirectional clipboard sync.

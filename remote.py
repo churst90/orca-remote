@@ -40,6 +40,7 @@ from orca.command import Command, KeyboardCommand  # noqa: E402
 from orca.extension import Extension  # noqa: E402
 
 from . import protocol
+from . import braille_table
 from .settings_dialog import (
     DEFAULT_SETTINGS,
     ROLE_CLIENT,
@@ -140,9 +141,21 @@ class RemoteExtension(Extension):
         # speaks. The user reported this as the master hearing
         # everything twice. Compare last-sent text and skip a repeat.
         self._last_outbound_speech: str = ""
+        # Same idea for braille: a long-running line refresh produces
+        # many braille_emitted with identical text+cursor; drop repeats.
+        self._last_outbound_braille: tuple[str, int] = ("", -2)
+        # Set True on the first set_braille_info we send per session
+        # so we re-send the dimensions only when the master would have
+        # forgotten (a fresh channel_joined). Reset on disconnect.
+        self._sent_braille_info: bool = False
         # Counters surfaced via _log to give the user a way to see if
         # we're silently dropping things. Reset on disable.
         self._dropped_nonstring_items: int = 0
+        # User toggles surfaced via the remote menu. Defaults match
+        # "everything on" so first-time users get the full experience;
+        # menu items flip these without restarting the transport.
+        self._mirror_speech: bool = True
+        self._mirror_braille: bool = True
         super().__init__()
 
     # ---- lifecycle -------------------------------------------------
@@ -182,6 +195,13 @@ class RemoteExtension(Extension):
             self.controller.subscribe_speech_emitted(self._on_speech_emitted)
         except AttributeError:
             self._log("controller has no subscribe_speech_emitted (older Orca?)")
+        # Same for braille. Hook landed in perf branch after speech;
+        # AttributeError just means we're on a pre-braille-hook Orca,
+        # in which case braille mirroring is silently unavailable.
+        try:
+            self.controller.subscribe_braille_emitted(self._on_braille_emitted)
+        except AttributeError:
+            self._log("controller has no subscribe_braille_emitted (older Orca?)")
 
     def disable(self) -> None:
         """Stop the transport, then deregister commands."""
@@ -196,8 +216,14 @@ class RemoteExtension(Extension):
             self._dropped_nonstring_items = 0
         self._announced_join = False
         self._last_outbound_speech = ""
+        self._last_outbound_braille = ("", -2)
+        self._sent_braille_info = False
         try:
             self.controller.unsubscribe_speech_emitted(self._on_speech_emitted)
+        except AttributeError:
+            pass
+        try:
+            self.controller.unsubscribe_braille_emitted(self._on_braille_emitted)
         except AttributeError:
             pass
         self._stop_transport()
@@ -223,6 +249,10 @@ class RemoteExtension(Extension):
             return
         if not text:
             return
+        # User toggle: when the menu mutes mirroring, hold the
+        # transport open but stop emitting speak frames to the master.
+        if not self._mirror_speech:
+            return
 
         # Coalesce identical back-to-back utterances. Orca legitimately
         # emits the same string twice in some flows (focus-of-focus,
@@ -240,6 +270,56 @@ class RemoteExtension(Extension):
         # ACSS / index marks can come later.
         message = {"type": protocol.MSG_SPEAK, "sequence": [text]}
         self._schedule_send(message, what="speech")
+
+    def _on_braille_emitted(self, text: str, cursor_cell: int) -> None:
+        """Forward Orca's braille refresh to the remote master.
+
+        Host-mode only. `text` is the rendered braille string,
+        `cursor_cell` is 0-based (or -1 if no cursor).
+
+        NVDA Remote's `display` payload is a list of cell bytes (one
+        per cell, low byte = dots 1..8). We translate text -> cells
+        via braille_table.text_to_cells; see that module's docstring
+        for the limitations (English-only, lossy for other scripts).
+        """
+
+        if self._current_role() != ROLE_HOST:
+            return
+        if self._transport is None or self._loop is None:
+            return
+        if not self._mirror_braille:
+            return
+
+        cells = braille_table.text_to_cells(text)
+        # Skip empty refreshes (e.g. a paint with no content yet).
+        if not cells:
+            return
+        # Drop unchanged frames. braille_emitted fires on EVERY paint
+        # including ones where nothing changed (e.g. caret-but-same-line
+        # refreshes). The master sees no value in identical frames.
+        key = (text, cursor_cell)
+        if key == self._last_outbound_braille:
+            return
+        self._last_outbound_braille = key
+
+        # Send dimensions to the master once per session so its braille
+        # viewer knows the column count. set_braille_info is sticky on
+        # NVDA's side; resending on every paint would just be noise.
+        if not self._sent_braille_info:
+            self._schedule_send(
+                {
+                    "type": protocol.MSG_SET_BRAILLE_INFO,
+                    "name": "orca",
+                    "numCells": len(cells),
+                },
+                what="braille-info",
+            )
+            self._sent_braille_info = True
+
+        self._schedule_send(
+            {"type": protocol.MSG_DISPLAY, "cells": cells},
+            what="braille",
+        )
 
     def _schedule_send(self, message: dict, *, what: str) -> None:
         """Schedule a fire-and-forget send onto the asyncio loop.
@@ -615,8 +695,50 @@ class RemoteExtension(Extension):
             text = str(message.get("text", "") or "")
             if text:
                 GLib.idle_add(self._set_clipboard_idle_cb, text)
+        elif msg_type == protocol.MSG_SET_BRAILLE_INFO:
+            # Peer told us their braille display dimensions. We don't
+            # currently render inbound braille (needs another perf-
+            # branch hook to push to local BrlAPI), so just log.
+            num_cells = message.get("numCells", "?")
+            name = message.get("name", "?")
+            self._log(f"peer braille info: name={name!r} cells={num_cells}")
+        elif msg_type == protocol.MSG_DISPLAY:
+            # Inbound braille from the peer. Same story: no renderer
+            # yet. Log cell count at debug only; full text-from-cells
+            # reverse decode is future work.
+            cells = message.get("cells") or []
+            if isinstance(cells, list):
+                self._log(f"inbound braille frame: {len(cells)} cell(s)")
         else:
             self._log(f"unhandled message type: {msg_type}")
+
+    def toggle_speech_mirror(self) -> bool:
+        """Flip the host-mode speech mirror on/off. Spoken feedback."""
+
+        self._mirror_speech = not self._mirror_speech
+        if self._mirror_speech:
+            self._say("Orca Remote: speech mirroring enabled.")
+        else:
+            self._say("Orca Remote: speech mirroring muted.")
+        # Reset the coalesce sentinel so re-enabling speaks the next
+        # utterance even if it happens to match the last one we sent.
+        self._last_outbound_speech = ""
+        return True
+
+    def toggle_braille_mirror(self) -> bool:
+        """Flip the host-mode braille mirror on/off. Spoken feedback."""
+
+        self._mirror_braille = not self._mirror_braille
+        if self._mirror_braille:
+            self._say("Orca Remote: braille mirroring enabled.")
+        else:
+            self._say("Orca Remote: braille mirroring disabled.")
+        # Same sentinel reset as speech, and force a fresh
+        # set_braille_info on the next paint so the master gets the
+        # dimensions again in case it forgot.
+        self._last_outbound_braille = ("", -2)
+        self._sent_braille_info = False
+        return True
 
     def push_clipboard(self) -> bool:
         """Send the local clipboard text to the peer as set_clipboard_text.
