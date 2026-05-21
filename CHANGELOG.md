@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.6.0 -- 2026-05-21
+
+Master-side key forwarding (Linux Orca master -> NVDA / Orca slave).
+
+Requires perf-branch commit `5fe13e743` (subscribe_keyboard_event
+hook). On older Orca the AttributeError on subscribe is silently
+swallowed and forwarding is unavailable.
+
+- **`keymap.keysym_to_vk(keysym) -> (vk_code, extended)`**: reverse
+  lookup built once at module init from the existing forward
+  tables. Extended-flag bias matches NVDA Remote's wire (main-row
+  Page_Up = extended=True; numpad KP_Page_Up = extended=False).
+- **`_on_keyboard_event` handler**: subscribes to perf-branch
+  keyboard_event. Active only when role=client AND
+  `_focus_on_remote=True` AND a live transport. Translates keysym
+  -> VK and emits `key` frames for press AND release.
+- **F11 escape**: while forwarding is active, plain F11 fires
+  `switch_side()` (flips `_focus_on_remote` back off) and is
+  itself consumed. Matches NVDA Remote's "send keys" convention.
+  Without this escape the user has no way to fire Orca+Alt+Tab
+  -- its component keys all go on the wire.
+- **Unmapped keysyms pass through**: keysym_to_vk -> (0, False)
+  returns False from the handler so an exotic key reaches Orca
+  normally instead of being silently dropped.
+
+**LIMITATION** (documented in docs/architecture.md): this is
+Orca-dispatch consume only. The key still reaches the focused
+application via the X server -- AT-SPI's true consume needs
+`Atspi.Device.add_key_grab` per-keysym. Practical effect: while
+forwarding, your local Orca won't fire commands on the keys, but
+they ALSO type into whatever local app has focus. The honest
+answer for daily use right now: minimize a benign window to
+absorb the local keystrokes, or wait for the planned grab_keyset
+follow-up that adds full system-level consume.
+
 ## 0.5.7 -- 2026-05-21
 
 Real popup context menu (NVDA NVDA+N style).

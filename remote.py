@@ -53,7 +53,7 @@ from .settings_dialog import (
     SETTING_ROLE,
     build_settings_dialog,
 )
-from .keymap import vk_to_keysym
+from .keymap import keysym_to_vk, vk_to_keysym
 from .protocol import CONNECTION_TYPE_MASTER, CONNECTION_TYPE_SLAVE
 from .remote_menu import build_remote_menu
 from .transport import RemoteTransport
@@ -87,6 +87,14 @@ _OWN_CTRL_CHORD_KEYSYMS: frozenset[int] = frozenset({
 _OWN_ALT_CHORD_KEYSYMS: frozenset[int] = frozenset({
     0xff09,  # XK_Tab        -> switch_side
 })
+
+# F11 is the master-side "send keys back to local" escape: when
+# focus_on_remote is True we forward every key, so the user has no
+# way to fire our Orca+Alt+Tab toggle (its component keys go on
+# the wire). Plain F11 with no modifiers is the universal escape
+# hatch -- consumed locally, fires switch_side, never forwarded.
+# Chosen to match NVDA Remote's F11 "send keys" convention.
+_FORWARD_ESCAPE_KEYSYM: int = 0xffc8  # XK_F11
 
 
 def _settings_path() -> str:
@@ -210,6 +218,15 @@ class RemoteExtension(Extension):
             self.controller.subscribe_braille_emitted(self._on_braille_emitted)
         except AttributeError:
             self._log("controller has no subscribe_braille_emitted (older Orca?)")
+        # And keyboard events for master-side key forwarding. Hook
+        # landed even later; pre-hook Orca silently has no forwarding.
+        try:
+            self.controller.subscribe_keyboard_event(self._on_keyboard_event)
+        except AttributeError:
+            self._log(
+                "controller has no subscribe_keyboard_event "
+                "(older Orca?); master-side keys unavailable"
+            )
 
     def disable(self) -> None:
         """Stop the transport, then deregister commands."""
@@ -232,6 +249,10 @@ class RemoteExtension(Extension):
             pass
         try:
             self.controller.unsubscribe_braille_emitted(self._on_braille_emitted)
+        except AttributeError:
+            pass
+        try:
+            self.controller.unsubscribe_keyboard_event(self._on_keyboard_event)
         except AttributeError:
             pass
         self._stop_transport()
@@ -278,6 +299,86 @@ class RemoteExtension(Extension):
         # ACSS / index marks can come later.
         message = {"type": protocol.MSG_SPEAK, "sequence": [text]}
         self._schedule_send(message, what="speech")
+
+    def _on_keyboard_event(
+        self,
+        pressed: bool,
+        keycode: int,
+        keysym: int,
+        modifiers: int,
+        text: str,
+    ) -> bool:
+        """Master-side key forwarding hook.
+
+        Called from perf-branch input_event_manager BEFORE Orca's
+        own command dispatch. Returns True to consume from Orca's
+        perspective (Orca skips event.process() for this event).
+
+        Behavior:
+        - Inactive unless role=client AND _focus_on_remote AND a
+          live transport. Otherwise returns False (passthrough).
+        - F11 alone is the universal escape: while forwarding is
+          active, F11 fires switch_side() to flip _focus_on_remote
+          back off, and is itself consumed (never goes on the wire).
+          Chosen to match NVDA Remote's "send keys" convention.
+        - Anything else maps via keysym_to_vk and is sent as an
+          NVDA Remote v2 `key` frame with (vk_code, extended,
+          pressed). Unmapped keysyms (keysym_to_vk returns (0, ...))
+          are NOT consumed -- Orca processes them normally so an
+          exotic key isn't silently swallowed.
+
+        LIMITATION: this is Orca-dispatch consume only. The key
+        still reaches the focused application via the X server.
+        Practical effect: while forwarding, your local Orca won't
+        fire commands on the keys, but they ALSO type into whatever
+        local app has focus. Full system-level consume needs
+        Atspi.Device.add_key_grab (per-keysym) -- a future
+        enhancement, see docs/architecture.md "Deferred work."
+        """
+
+        # Cheap guards first so non-forwarding sessions pay nothing.
+        if self._current_role() != ROLE_CLIENT:
+            return False
+        if not self._focus_on_remote:
+            return False
+        if self._transport is None:
+            return False
+
+        # F11 escape: fire switch_side on press, consume both press
+        # and release so neither leaks to the wire or the local app's
+        # F11 handler (e.g. browser fullscreen).
+        if keysym == _FORWARD_ESCAPE_KEYSYM:
+            if pressed:
+                # Defer switch_side to the next main-loop tick so we
+                # return from the handler before mutating state that
+                # this same dispatch cycle is observing.
+                GLib.idle_add(self._switch_side_idle_cb)
+            return True
+
+        vk_code, extended = keysym_to_vk(keysym)
+        if vk_code == 0:
+            # Unmapped; pass through to Orca so an exotic key isn't
+            # silently dropped.
+            return False
+
+        self._schedule_send(
+            {
+                "type": protocol.MSG_KEY,
+                "vk_code": vk_code,
+                "extended": extended,
+                "pressed": pressed,
+                "scan_code": 0,
+            },
+            what="key",
+        )
+        return True
+
+    def _switch_side_idle_cb(self) -> bool:
+        try:
+            self.switch_side()
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"switch_side from F11 escape failed: {error}")
+        return False  # one-shot
 
     def _on_braille_emitted(self, text: str, cursor_cell: int) -> None:
         """Forward Orca's braille refresh to the remote master.

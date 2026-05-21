@@ -158,3 +158,61 @@ class TestTableCompleteness:
         # half the table. 26 letters + 10 digits + 10 KP digits + 24
         # F-keys + ~75 named/extended is comfortably >120.
         assert len(keymap._VK_TO_KEYSYM) >= 120
+
+
+class TestKeysymToVk:
+    """Reverse: X11 keysym -> (vk_code, extended). Used for master-side key forwarding."""
+
+    def test_letter_round_trip(self) -> None:
+        # Forward: VK_A (0x41) -> XK_a (0x61).
+        # Reverse: XK_a -> (VK_A, False).
+        assert keymap.keysym_to_vk(0x61) == (0x41, False)
+        assert keymap.keysym_to_vk(0x7a) == (0x5a, False)  # XK_z -> VK_Z
+
+    def test_digit_round_trip(self) -> None:
+        assert keymap.keysym_to_vk(0x30) == (0x30, False)  # '0'
+        assert keymap.keysym_to_vk(0x39) == (0x39, False)  # '9'
+
+    def test_keypad_digit_round_trip(self) -> None:
+        assert keymap.keysym_to_vk(0xffb0) == (0x60, False)  # XK_KP_0 -> VK_NUMPAD0
+        assert keymap.keysym_to_vk(0xffb9) == (0x69, False)
+
+    def test_function_key_round_trip(self) -> None:
+        assert keymap.keysym_to_vk(0xffbe) == (0x70, False)  # F1
+        assert keymap.keysym_to_vk(0xffc9) == (0x7b, False)  # F12
+
+    def test_nav_cluster_extended_split(self) -> None:
+        # Numpad nav (non-extended) and main-row nav (extended) both
+        # exist in the reverse table; each points at the right VK
+        # with the right extended bit.
+        assert keymap.keysym_to_vk(0xff9a) == (0x21, False)  # KP_Page_Up
+        assert keymap.keysym_to_vk(0xff55) == (0x21, True)   # Page_Up
+        assert keymap.keysym_to_vk(0xff9e) == (0x2D, False)  # KP_Insert
+        assert keymap.keysym_to_vk(0xff63) == (0x2D, True)   # Insert
+
+    def test_return_vs_kp_enter(self) -> None:
+        assert keymap.keysym_to_vk(0xff0d) == (0x0D, False)  # Return
+        assert keymap.keysym_to_vk(0xff8d) == (0x0D, True)   # KP_Enter
+
+    def test_left_right_modifiers_reverse_distinctly(self) -> None:
+        # Left/Right control / alt have distinct VK codes; reverse
+        # should preserve that.
+        assert keymap.keysym_to_vk(0xffe3)[0] in (0x11, 0xA2)  # Control_L
+        assert keymap.keysym_to_vk(0xffe4) == (0x11, True)     # Control_R (extended override wins)
+
+    def test_unmapped_returns_zero(self) -> None:
+        # An arbitrary keysym not in the table.
+        assert keymap.keysym_to_vk(0xdeadbe) == (0, False)
+        # XK_VoidSymbol just to be sure.
+        assert keymap.keysym_to_vk(0xffffff) == (0, False)
+
+    def test_forward_reverse_round_trip_sample(self) -> None:
+        # For every VK in the forward table, reverse-lookup of the
+        # mapped keysym should give us *some* VK back. (Exact match
+        # not guaranteed for keysyms appearing in both forward and
+        # extended; the test of nav-cluster above covers those.)
+        for vk in (0x41, 0x4d, 0x5a, 0x30, 0x39, 0x70, 0x7b):
+            keysym = keymap.vk_to_keysym(vk)
+            assert keysym != 0, f"VK 0x{vk:x} not in forward table"
+            got_vk, _ext = keymap.keysym_to_vk(keysym)
+            assert got_vk != 0, f"keysym 0x{keysym:x} not in reverse table"

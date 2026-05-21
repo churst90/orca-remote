@@ -181,3 +181,44 @@ def vk_to_keysym(vk_code: int, extended: bool = False) -> int:
     if extended and vk_code in _EXTENDED_OVERRIDES:
         return _EXTENDED_OVERRIDES[vk_code]
     return _VK_TO_KEYSYM.get(vk_code, 0)
+
+
+# Reverse: X11 keysym -> (vk_code, extended_flag). Built once at
+# module init from the forward tables. Extended-flag bias: if a
+# keysym appears in _EXTENDED_OVERRIDES (e.g. XK_Page_Up for main-
+# row Page Up vs XK_KP_Page_Up for numpad Page Up), the override
+# wins and the table records extended=True. The non-extended source
+# keysym still maps to extended=False because both sides of the
+# nav-cluster split are real X11 keysyms in their own right.
+def _build_reverse_table() -> dict[int, tuple[int, bool]]:
+    table: dict[int, tuple[int, bool]] = {}
+    # Forward (non-extended) first so extended overrides them by
+    # winning the same keysym key when it matches one. In practice
+    # the extended keysyms (XK_Page_Up etc.) are DIFFERENT from the
+    # non-extended ones (XK_KP_Page_Up), so both sides coexist in
+    # this table -- one points back at the extended VK, the other at
+    # the non-extended VK.
+    for vk, keysym in _VK_TO_KEYSYM.items():
+        if keysym != 0 and keysym not in table:
+            table[keysym] = (vk, False)
+    for vk, keysym in _EXTENDED_OVERRIDES.items():
+        if keysym != 0:
+            table[keysym] = (vk, True)
+    return table
+
+
+_KEYSYM_TO_VK: dict[int, tuple[int, bool]] = _build_reverse_table()
+
+
+def keysym_to_vk(keysym: int) -> tuple[int, bool]:
+    """Translate an X11 keysym to (vk_code, extended) for outbound keys.
+
+    Returns (0, False) if the keysym isn't in our table; callers
+    should drop the event rather than guess. Used by master-side key
+    forwarding (Linux Orca master -> NVDA / Orca slave): when the
+    extension consumes a local key and forwards it on the wire,
+    NVDA Remote v2's `key` frame requires the originating-machine
+    Windows VK code, which is what this returns.
+    """
+
+    return _KEYSYM_TO_VK.get(keysym, (0, False))

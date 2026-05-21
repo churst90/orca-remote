@@ -23,8 +23,8 @@ This README covers install, configure, and the menu. Deeper docs:
 | Orca host → NVDA master| YES    | YES (Latin-only) | n/a  | OUT-OK    |
 | Orca host → Orca master| YES    | YES (Latin-only) | n/a  | OUT-OK    |
 | NVDA master → Orca host| n/a    | n/a (log only)   | YES  | IN-OK     |
-| Orca master → Orca host| n/a    | n/a (log only)   | NO   | IN-OK     |
-| Orca master → NVDA host| n/a    | n/a (log only)   | NO   | IN-OK     |
+| Orca master → Orca host| n/a    | n/a (log only)   | PARTIAL | IN-OK  |
+| Orca master → NVDA host| n/a    | n/a (log only)   | PARTIAL | IN-OK  |
 
 **YES** = implemented and exercised. **NO** = not yet implemented;
 gap is documented in [docs/architecture.md](docs/architecture.md)
@@ -36,10 +36,13 @@ Notes:
   ASCII→cell table, so English text renders correctly on a master's
   braille viewer. Non-Latin scripts come through as blank cells.
 - **Master-side key forwarding** (Orca user typing on the Linux
-  master to control a Windows / Linux slave) is the biggest
-  remaining gap. It needs either a new "consume keyboard event"
-  hook on the perf-branch controller or a large set of AT-SPI key
-  grabs. Tracked for a future release.
+  master to control a Windows / Linux slave) is **PARTIAL** as of
+  0.6.0. Keys are forwarded to the slave and Orca's own dispatch
+  is skipped, but the keys ALSO reach the focused application on
+  the master (AT-SPI's true consume needs per-keysym grabs, which
+  is tracked as a follow-up). While forwarding is active, plain
+  **F11** is the escape: it fires the "focus on local" toggle
+  without going on the wire. Matches NVDA Remote's F11 convention.
 - **File transfer** is not in scope — the v2 wire has no
   file-transfer message, and a custom one would lose NVDA interop.
 
