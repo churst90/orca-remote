@@ -132,6 +132,17 @@ class RemoteExtension(Extension):
         # 30s (the backoff cap), which is what the VM crash session
         # heard as "repeating things over and over."
         self._announced_join: bool = False
+        # Host-side de-duplication of consecutive identical speech.
+        # Orca emits the same string twice in rapid succession in a
+        # few legitimate code paths (caret-moved + name-changed,
+        # focus-of-focus, etc.). On the wire each duplicate becomes a
+        # separate NVDA speak frame that the master's NVDA queues and
+        # speaks. The user reported this as the master hearing
+        # everything twice. Compare last-sent text and skip a repeat.
+        self._last_outbound_speech: str = ""
+        # Counters surfaced via _log to give the user a way to see if
+        # we're silently dropping things. Reset on disable.
+        self._dropped_nonstring_items: int = 0
         super().__init__()
 
     # ---- lifecycle -------------------------------------------------
@@ -176,7 +187,15 @@ class RemoteExtension(Extension):
         """Stop the transport, then deregister commands."""
 
         self._log("disabling")
+        if self._dropped_nonstring_items:
+            self._log(
+                f"dropped {self._dropped_nonstring_items} non-string "
+                f"sequence item(s) over this session (LangChange / "
+                f"IndexCommand / etc.)"
+            )
+            self._dropped_nonstring_items = 0
         self._announced_join = False
+        self._last_outbound_speech = ""
         try:
             self.controller.unsubscribe_speech_emitted(self._on_speech_emitted)
         except AttributeError:
@@ -205,23 +224,55 @@ class RemoteExtension(Extension):
         if not text:
             return
 
+        # Coalesce identical back-to-back utterances. Orca legitimately
+        # emits the same string twice in some flows (focus-of-focus,
+        # caret-moved followed by name-changed). Each duplicate becomes
+        # a separate NVDA speak frame on the master, which speaks both.
+        # Done here on the GLib thread so we don't race with the
+        # asyncio side.
+        if text == self._last_outbound_speech:
+            return
+        self._last_outbound_speech = text
+
         # NVDA Remote's speak message: {"type":"speak","sequence":[...]}
         # where sequence entries are either strings (text) or dicts
-        # (speech commands). For Stage 2 we forward a single text
-        # fragment; richer ACSS / index marks can come later.
+        # (speech commands). We forward a single text fragment; richer
+        # ACSS / index marks can come later.
         message = {"type": protocol.MSG_SPEAK, "sequence": [text]}
+        self._schedule_send(message, what="speech")
+
+    def _schedule_send(self, message: dict, *, what: str) -> None:
+        """Schedule a fire-and-forget send onto the asyncio loop.
+
+        `what` is a short tag used in the failure log line so a user
+        looking at the Orca debug log can tell which kind of message
+        failed (speech vs cancel vs key vs clipboard). The future is
+        watched via add_done_callback so transport-side exceptions
+        aren't silently swallowed.
+        """
+
+        if self._transport is None or self._loop is None:
+            return
         transport = self._transport
 
         async def _send() -> None:
             await transport.send(message)
 
         try:
-            asyncio.run_coroutine_threadsafe(_send(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(_send(), self._loop)
         except RuntimeError:
-            # Loop was closed between the check and the schedule.
-            # Drop the utterance silently; it's only worth logging at
-            # debug level.
-            pass
+            # Loop was closed between the check and the schedule. Drop.
+            return
+
+        def _on_done(fut: Any) -> None:
+            try:
+                exc = fut.exception()
+            except Exception:  # pylint: disable=broad-except
+                return
+            if exc is not None:
+                self._log(f"outbound {what} send failed: {exc!r}")
+
+        future.add_done_callback(_on_done)
 
     # ---- command registration -------------------------------------
     #
@@ -398,8 +449,28 @@ class RemoteExtension(Extension):
         path = _settings_path()
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(self._settings, handle, indent=2)
+            # Write with restrictive perms BEFORE writing the content,
+            # so the channel key (a shared passphrase) is never on disk
+            # at default umask. os.open + fdopen avoids the window
+            # where open(path,"w") would create with 0644.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(path, flags, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(self._settings, handle, indent=2)
+            except Exception:
+                # fdopen owns the fd on success; on failure we close.
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            # Tighten perms on a pre-existing file that might have been
+            # created at a wider umask before this safeguard landed.
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except OSError as error:
             self._log(f"settings save failed: {error}")
 
@@ -511,9 +582,18 @@ class RemoteExtension(Extension):
                 self._current_role() == ROLE_CLIENT
                 and self._focus_on_remote
             ):
-                text = protocol.extract_speech_text(message)
+                text, dropped = protocol.extract_speech_text(message)
+                if dropped:
+                    self._dropped_nonstring_items += dropped
                 if text:
                     self._say_async(text)
+        elif msg_type in (protocol.MSG_CANCEL, protocol.MSG_PAUSE_SPEECH):
+            # The peer is asking us to flush queued speech (cancel) or
+            # pause (pause_speech). Screen-reader use cases treat both
+            # as "shut up right now"; we don't have a pause-and-resume
+            # surface so cancel-equivalent is the right behavior.
+            if self._current_role() == ROLE_CLIENT:
+                GLib.idle_add(self._interrupt_speech_idle_cb)
         elif msg_type == protocol.MSG_CHANNEL_JOINED:
             if self._announced_join:
                 return
@@ -566,28 +646,28 @@ class RemoteExtension(Extension):
 
         # Two-part interrupt on every PRESS:
         #
-        # 1. MSG_CANCEL outbound to the master, BEFORE we synth. The
-        #    master's NVDA holds a speech queue of every speak message
-        #    we've forwarded; pressing Ctrl on the master cancels
-        #    NVDA's *local* speech but does nothing to that queue
-        #    because the wire never told the master to drain. NVDA
-        #    Remote v2.x's `cancel` message is exactly the signal to
-        #    drain it. Sending CANCEL inline (await rather than schedule)
-        #    keeps it strictly ordered before any speak we generate by
-        #    reacting to this same key.
+        # 1. MSG_CANCEL outbound to the master, scheduled (not awaited).
+        #    The master's NVDA holds a speech queue of every speak
+        #    message we've forwarded; pressing Ctrl on the master
+        #    cancels NVDA's *local* speech but does nothing to that
+        #    queue because the wire never told the master to drain.
+        #    NVDA Remote v2.x's `cancel` message is exactly the signal
+        #    to drain it. We schedule via run_coroutine_threadsafe (in
+        #    _schedule_send) rather than await directly here so a
+        #    backed-up writer can't stall the read loop and serialize
+        #    every subsequent inbound key behind it -- the cause of
+        #    "web browsing feels very sluggish" reports under load.
+        #    Ordering vs any SPEAK we generate by reacting to this
+        #    same key is still preserved because writer.write() pushes
+        #    to the buffer in scheduling order and SPEAK only comes
+        #    back through the loop after the synth has reached AT-SPI.
         # 2. Local SpeechManager.InterruptSpeech via GLib idle. Orca's
         #    natural interrupt-on-key path (_present) should also fire
         #    when XTest delivers the event we're about to synth, but
         #    under VM AT-SPI load it can lag noticeably. This makes
         #    the slave's own speech-dispatcher cancel deterministic.
         if pressed:
-            if self._transport is not None:
-                try:
-                    await self._transport.send(
-                        {"type": protocol.MSG_CANCEL},
-                    )
-                except Exception as error:  # pylint: disable=broad-except
-                    self._log(f"outbound CANCEL failed: {error}")
+            self._schedule_send({"type": protocol.MSG_CANCEL}, what="cancel")
             GLib.idle_add(self._interrupt_speech_idle_cb)
 
         GLib.idle_add(self._synthesize_key_idle_cb, keysym, pressed)

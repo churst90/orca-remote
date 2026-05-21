@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.5.0 -- 2026-05-21
+
+Flow-control and silent-drop fixes. First wave of a larger Stage-3
+push (bidirectional menu UI, clipboard, braille, master-side key
+forwarding). 0.5.0 is the foundation; user-visible features land in
+0.5.x and 0.6.x.
+
+- **Fire-and-forget outbound CANCEL.** The 0.4.4 inline
+  `await transport.send({"type":"cancel"})` inside the inbound key
+  handler was serializing every subsequent inbound key behind the
+  CANCEL's `writer.drain()`, which under VM-network jitter caused
+  the "web browsing is very sluggish" symptom: each arrow press
+  paid a per-key round-trip. CANCEL now schedules via
+  `run_coroutine_threadsafe`; ordering vs any SPEAK reaction to the
+  same key is still preserved because `writer.write()` buffers in
+  scheduling order.
+- **Bounded outbound buffer with drop counter.** `RemoteTransport.send`
+  now checks `transport.get_write_buffer_size()` and drops the frame
+  (incrementing a counter) when over 256 KiB. Stops unbounded
+  backlog on congested links, which previously cascaded into
+  drain-backpressure on every producer. The first drop and every
+  50th drop are surfaced via the status callback.
+- **Done-callback on every scheduled send.** New `_schedule_send`
+  helper in the extension wraps `run_coroutine_threadsafe` and adds
+  a done-callback so transport-side exceptions are logged with the
+  kind of message that failed (`speech` / `cancel` / `key`), not
+  silently swallowed.
+- **Coalesce identical back-to-back outbound speech.** Orca emits
+  the same string twice in a few legitimate flows (caret-moved +
+  name-changed, focus-of-focus); the master's NVDA queues and speaks
+  both. Host mode now compares last-sent text and skips a repeat.
+  Reset on disable/disconnect so a reconnect doesn't accidentally
+  swallow a fresh first utterance.
+- **`pause_speech` inbound is now handled.** Treated the same as
+  `cancel` (screen-reader use wants "stop now," not pause/resume).
+  Previously we recognized the constant but never acted on it.
+- **Bigger reader limit.** `asyncio.open_connection(limit=1MiB)` so
+  a legitimate huge speak/braille frame doesn't trip
+  `LimitOverrunError`. Default was 64 KiB.
+- **Settings file written with 0o600.** Channel key (a shared
+  passphrase) used to land at default umask -- usually 0o644.
+  Created via `os.open(..., 0o600)`; an existing 0o644 file is
+  tightened on next save.
+- **Non-string sequence-item counter.** `extract_speech_text` now
+  returns `(text, dropped)`. The extension accumulates the dropped
+  count for the session and logs the total on disable, so a user
+  with NVDA-side speech commands (LangChange, IndexCommand) can see
+  what's being lost.
+
 ## 0.4.4 -- 2026-05-21
 
 Master-queue cancel: send MSG_CANCEL to the master on every inbound

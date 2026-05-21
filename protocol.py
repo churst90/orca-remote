@@ -107,20 +107,27 @@ def build_ping() -> dict[str, Any]:
     return {"type": MSG_PING}
 
 
-def extract_speech_text(speak_message: dict[str, Any]) -> str:
-    """Pull human-readable text out of a `speak` message's sequence.
+def extract_speech_text(speak_message: dict[str, Any]) -> tuple[str, int]:
+    """Pull human-readable text and a dropped-item count from a `speak`.
 
     NVDA Remote's `speak` payload is `{"sequence": [...]}` where each
     element is either a plain string (text to speak) or a dict
     describing a speech command (IndexCommand, LangChangeCommand,
-    CharacterModeCommand, etc.). Stage 1 ignores commands and
-    concatenates the plain-string fragments, which is what the user
-    actually hears.
+    CharacterModeCommand, etc.). We ignore commands and concatenate
+    the plain-string fragments, which is what the user actually hears.
+
+    Returns (text, dropped) where `dropped` is the number of sequence
+    items that were NOT plain strings. Callers can surface a counter
+    so the user can see when we're losing structure (e.g. language
+    switches, index marks) -- silent drops were previously invisible.
     """
 
     sequence: Iterable[Any] = speak_message.get("sequence", []) or []
     parts: list[str] = []
+    dropped = 0
     for item in sequence:
         if isinstance(item, str):
             parts.append(item)
-    return "".join(parts).strip()
+        else:
+            dropped += 1
+    return "".join(parts).strip(), dropped

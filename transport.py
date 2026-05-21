@@ -26,6 +26,23 @@ from . import protocol
 _BACKOFF_SCHEDULE: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
 
 
+# Max inbound line size accepted from the relay. NVDA Remote frames
+# are normally well under 4 KiB; we cap at 1 MiB so a misbehaving or
+# malicious peer can't OOM us by streaming an unbounded line, but a
+# legitimate huge speak/braille frame still goes through.
+_READ_LIMIT: int = 1 * 1024 * 1024
+
+# Drop outbound sends when the writer's pending buffer exceeds this
+# many bytes. Prevents the asyncio side from accumulating unbounded
+# backlog when the relay or its TCP path is congested: a slow link
+# with high speak volume would otherwise blow memory and stall
+# producers via drain() backpressure. 256 KiB is enough for hundreds
+# of typical speak frames in flight; if we're over that, dropping
+# fresh speech is the right call (the user is hearing stale audio
+# anyway).
+_MAX_WRITE_BUFFER: int = 256 * 1024
+
+
 class FingerprintMismatch(Exception):
     """Raised when the peer cert does not match the configured pin.
 
@@ -107,6 +124,12 @@ class RemoteTransport:
         self._task: asyncio.Task | None = None
         self._writer: asyncio.StreamWriter | None = None
 
+        # Cumulative count of outbound frames dropped because the
+        # writer's pending buffer was over _MAX_WRITE_BUFFER. Surfaced
+        # via status callback when nonzero so the user can see when
+        # the wire can't keep up.
+        self._dropped_outbound: int = 0
+
     def start(self) -> None:
         """Spawn the reconnect/read loop as an asyncio task."""
 
@@ -135,10 +158,41 @@ class RemoteTransport:
             self._task = None
 
     async def send(self, message: dict) -> None:
-        """Send a message dict; silently dropped if not connected."""
+        """Send a message dict; silently dropped if not connected.
+
+        Frames are also dropped (and counted) if the writer's pending
+        buffer is over `_MAX_WRITE_BUFFER`. This protects us from
+        unbounded backlog when the relay or its TCP path is congested
+        -- letting drain() block here would otherwise cascade into
+        backpressure on every producer (every speech_emitted, every
+        inbound key reaction). Dropping speech-and-cancel frames is
+        the right trade-off in that regime: by the time the buffer
+        clears the audio would be stale anyway.
+        """
 
         writer = self._writer
         if writer is None:
+            return
+        transport_obj = writer.transport
+        try:
+            buffered = (
+                transport_obj.get_write_buffer_size()
+                if transport_obj is not None else 0
+            )
+        except Exception:  # pylint: disable=broad-except
+            buffered = 0
+        if buffered > _MAX_WRITE_BUFFER:
+            self._dropped_outbound += 1
+            # Log on the first drop in each "episode" of congestion
+            # so the user gets one notice rather than a flood; the
+            # status callback is wired to debug.print_message in the
+            # extension, not to speech.
+            if self._dropped_outbound == 1 or self._dropped_outbound % 50 == 0:
+                self._on_status(
+                    f"outbound buffer congested "
+                    f"({buffered} bytes >{_MAX_WRITE_BUFFER}); "
+                    f"dropped {self._dropped_outbound} frame(s) so far"
+                )
             return
         try:
             writer.write(protocol.encode(message))
@@ -184,7 +238,12 @@ class RemoteTransport:
 
         self._on_status(f"connecting to {self._host}:{self._port}")
         reader, writer = await asyncio.open_connection(
-            self._host, self._port, ssl=_make_ssl_context()
+            self._host, self._port,
+            ssl=_make_ssl_context(),
+            # Bigger-than-default StreamReader buffer so a legitimately
+            # large speak/braille frame doesn't trip
+            # LimitOverrunError. See _READ_LIMIT comment for sizing.
+            limit=_READ_LIMIT,
         )
 
         # Fingerprint pin: refuse blank pins outright; compute the

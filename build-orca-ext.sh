@@ -20,7 +20,6 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
 fi
 
 PKG="$1"
-OUT="${2:-$(basename "$PKG").orca-ext}"
 
 if [ ! -d "$PKG" ]; then
     echo "error: $PKG is not a directory" >&2
@@ -29,6 +28,20 @@ fi
 if [ ! -f "$PKG/manifest.toml" ]; then
     echo "error: $PKG/manifest.toml is missing" >&2
     exit 1
+fi
+
+# Default output name comes from the manifest's [extension].name so
+# `./build-orca-ext.sh .` does the right thing without forcing the
+# caller to spell out the filename.
+if [ "$#" -eq 2 ]; then
+    OUT="$2"
+else
+    NAME="$(awk -F '"' '/^name *=/ {print $2; exit}' "$PKG/manifest.toml")"
+    if [ -z "$NAME" ]; then
+        echo "error: could not parse extension name from $PKG/manifest.toml" >&2
+        exit 1
+    fi
+    OUT="$NAME.orca-ext"
 fi
 
 # Resolve OUT to an absolute path BEFORE we cd, so relative output
