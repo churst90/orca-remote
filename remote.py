@@ -44,6 +44,7 @@ from .settings_dialog import (
     DEFAULT_SETTINGS,
     ROLE_CLIENT,
     ROLE_HOST,
+    SETTING_AUTO_CONNECT,
     SETTING_CHANNEL,
     SETTING_FINGERPRINT,
     SETTING_HOST,
@@ -51,11 +52,55 @@ from .settings_dialog import (
     SETTING_ROLE,
     build_settings_dialog,
 )
+from .keymap import vk_to_keysym
 from .protocol import CONNECTION_TYPE_MASTER, CONNECTION_TYPE_SLAVE
 from .transport import RemoteTransport
 
 
 _SETTINGS_FILENAME = "orca-remote-settings.json"
+
+
+# Locking keysyms we refuse to synthesize. XTest treats a PRESS of any
+# of these as a TOGGLE of the X server's lock state, and the toggle
+# survives Orca shutdown (it lives in X, not Orca). NVDA Remote
+# forwards Caps Lock as the NVDA-laptop-layout modifier, which would
+# otherwise stick the slave's caps lock on after one press and lock
+# the user out of every alphabetic Orca chord. We just drop the synth;
+# the slave-side user's own modifier remains in effect locally.
+_LOCKING_KEYSYMS: frozenset[int] = frozenset({
+    0xffe5,  # XK_Caps_Lock
+    0xff7f,  # XK_Num_Lock
+    0xff14,  # XK_Scroll_Lock
+})
+
+
+# Modifier keysyms whose press/release we use to recognize when an
+# inbound key sequence is about to complete one of our own command
+# chords. Tracked against `_pressed_keysyms`, which records what we've
+# synthesized PRESS for and not yet RELEASED.
+_ORCA_MOD_KEYSYMS: frozenset[int] = frozenset({
+    0xff63,  # XK_Insert       (desktop-layout Orca modifier)
+    0xff9e,  # XK_KP_Insert    (numpad variant)
+})
+_CTRL_KEYSYMS: frozenset[int] = frozenset({0xffe3, 0xffe4})
+_ALT_KEYSYMS: frozenset[int] = frozenset({0xffe9, 0xffea})
+
+# Keysyms that, when pressed while Orca-mod + Ctrl are held, would fire
+# one of our own commands (open_settings, connect, disconnect). Refused
+# in host mode so a remote master can't pop our settings dialog or
+# bounce the transport. Caps_Lock is in _LOCKING_KEYSYMS above and
+# never synthesized regardless, so the laptop-layout case is covered
+# even though it doesn't appear here.
+_OWN_CTRL_CHORD_KEYSYMS: frozenset[int] = frozenset({
+    0x72,    # XK_r          -> open_settings
+    0xff55,  # XK_Page_Up    -> connect
+    0xff56,  # XK_Page_Down  -> disconnect_session
+    0xff9a,  # XK_KP_Page_Up
+    0xff9b,  # XK_KP_Page_Down
+})
+_OWN_ALT_CHORD_KEYSYMS: frozenset[int] = frozenset({
+    0xff09,  # XK_Tab        -> switch_side
+})
 
 
 def _settings_path() -> str:
@@ -87,6 +132,22 @@ class RemoteExtension(Extension):
         # Orca+Alt+Tab. Has no effect when we're the host (a slave
         # never receives speak messages it needs to mute).
         self._focus_on_remote: bool = True
+        # Host-side: keysyms we've synthesized PRESS for but not yet
+        # RELEASE. If the transport drops between a press/release pair
+        # the X server would otherwise believe the key is still held,
+        # which survives Orca restart (Atspi.generate_keyboard_event
+        # uses XTEST). On disconnect / disable we drain this set with
+        # synthetic releases so a force-killed VM is never the only
+        # way out of a stuck modifier.
+        self._pressed_keysyms: set[int] = set()
+        # Set True the first time we see channel_joined for the current
+        # session intent; reset by explicit connect / disconnect /
+        # disable so user-initiated transitions re-announce but silent
+        # auto-reconnects do not. Without this, a flaky link to the
+        # relay produced a "connected in host mode" announcement every
+        # 30s (the backoff cap), which is what the VM crash session
+        # heard as "repeating things over and over."
+        self._announced_join: bool = False
         super().__init__()
 
     # ---- lifecycle -------------------------------------------------
@@ -99,21 +160,31 @@ class RemoteExtension(Extension):
     # set_up_commands.
 
     def set_up_commands(self) -> None:
-        """Register commands, then start the transport."""
+        """Register commands, then start the transport if the user
+        was connected at last shutdown.
+
+        We always spin up the asyncio thread so a later Orca+Ctrl+
+        Page Up can dial without re-entering setup, but we only
+        auto-dial when the persisted auto-connect flag says the user
+        had an active session before quitting. Explicit disconnect
+        (Orca+Ctrl+Page Down) flips that flag off and it stays off
+        across Orca restarts.
+        """
 
         super().set_up_commands()
         if self._disabled:
             return
-        self._log("starting transport")
         self._start_loop_thread()
-        self._restart_transport()
-        # Temporary diagnostic: subscribe to the new speech_emitted
-        # signal so we can verify it fires with sensible payloads.
-        # Logs every outbound utterance at INFO. Remove once Stage 2
-        # host mode actually forwards these on the wire.
+        if bool(self._settings.get(SETTING_AUTO_CONNECT, True)):
+            self._log("auto-connect enabled; starting transport")
+            self._restart_transport()
+        else:
+            self._log("auto-connect disabled; waiting for explicit connect")
+        # Subscribe to outbound Orca speech so host mode can mirror
+        # local utterances onto the relay. No-op on older Orca builds
+        # that predate the speech_emitted signal.
         try:
             self.controller.subscribe_speech_emitted(self._on_speech_emitted)
-            self._log("subscribed to speech_emitted")
         except AttributeError:
             self._log("controller has no subscribe_speech_emitted (older Orca?)")
 
@@ -121,11 +192,16 @@ class RemoteExtension(Extension):
         """Stop the transport, then deregister commands."""
 
         self._log("disabling")
+        self._announced_join = False
         try:
             self.controller.unsubscribe_speech_emitted(self._on_speech_emitted)
         except AttributeError:
             pass
         self._stop_transport()
+        # Belt-and-braces: _stop_transport already drains held keys,
+        # but if there was no transport to stop (e.g. extension toggled
+        # off without ever connecting) we still want this to fire.
+        self._release_held_keys()
         self._stop_loop_thread()
         super().disable()
 
@@ -210,20 +286,36 @@ class RemoteExtension(Extension):
         ]
 
     def connect(self) -> bool:
+        # Explicit connect: remember the intent so the next Orca
+        # restart re-dials automatically.
+        self._set_auto_connect(True)
         if self._transport is not None:
             self._say("Orca Remote already connected.")
             return True
+        # User asked to connect -- they should hear the next join.
+        self._announced_join = False
         self._say("Orca Remote: connecting.")
         self._restart_transport()
         return True
 
     def disconnect_session(self) -> bool:
+        # Explicit disconnect: clear the intent so the next Orca
+        # restart stays offline until the user reconnects.
+        self._set_auto_connect(False)
+        # Whatever happens next, the next join should announce again.
+        self._announced_join = False
         if self._transport is None:
             self._say("Orca Remote already disconnected.")
             return True
         self._say("Orca Remote: disconnecting.")
         self._stop_transport()
         return True
+
+    def _set_auto_connect(self, value: bool) -> None:
+        if bool(self._settings.get(SETTING_AUTO_CONNECT, True)) == value:
+            return
+        self._settings[SETTING_AUTO_CONNECT] = value
+        self._save_settings()
 
     def switch_side(self) -> bool:
         """Toggle the master's focus between remote and local.
@@ -248,11 +340,20 @@ class RemoteExtension(Extension):
         return True
 
     def open_settings(self) -> bool:
-        """Open the modal settings dialog and apply any changes on OK."""
+        """Show the non-blocking settings dialog; apply on OK."""
 
-        result = build_settings_dialog(dict(self._settings))
+        build_settings_dialog(dict(self._settings), self._on_settings_result)
+        return True
+
+    def _on_settings_result(self, result: dict[str, Any] | None) -> None:
+        """Apply the dict the settings dialog returned (or do nothing).
+
+        Invoked from the GLib main loop when the user closes the
+        dialog. `result` is None on cancel / window-close.
+        """
+
         if result is None:
-            return True
+            return
         changed = False
         for key, value in result.items():
             if self._settings.get(key) != value:
@@ -262,8 +363,10 @@ class RemoteExtension(Extension):
             self._save_settings()
             self._say("Orca Remote settings saved.")
             if not self._disabled:
+                # Settings change -> connect-affecting restart; the
+                # user deserves to hear the new join announce.
+                self._announced_join = False
                 self._restart_transport()
-        return True
 
     def _get_setting(self, key: str) -> Any:
         return self._settings.get(key, DEFAULT_SETTINGS.get(key))
@@ -281,6 +384,7 @@ class RemoteExtension(Extension):
             SETTING_FINGERPRINT, SETTING_ROLE,
         ):
             if not self._disabled:
+                self._announced_join = False
                 self._restart_transport()
 
     # ---- settings persistence -------------------------------------
@@ -390,6 +494,9 @@ class RemoteExtension(Extension):
 
     def _stop_transport(self) -> None:
         if self._loop is None or self._transport is None:
+            # No live transport, but we may still have a stale held-key
+            # set from a previous session. Drain it anyway.
+            self._release_held_keys()
             return
         transport = self._transport
         self._transport = None
@@ -402,6 +509,10 @@ class RemoteExtension(Extension):
             future.result(timeout=2.0)
         except Exception:  # pylint: disable=broad-except
             pass
+        # Release anything the remote master pressed before the link
+        # went down. Idle-scheduled so it runs on the GLib thread that
+        # owns AT-SPI synthesis.
+        self._release_held_keys()
 
     # ---- callbacks (run on asyncio thread) ------------------------
 
@@ -420,6 +531,9 @@ class RemoteExtension(Extension):
                 if text:
                     self._say_async(text)
         elif msg_type == protocol.MSG_CHANNEL_JOINED:
+            if self._announced_join:
+                return
+            self._announced_join = True
             role = self._current_role()
             if role == ROLE_HOST:
                 self._say_async("Orca Remote connected in host mode.")
@@ -431,8 +545,122 @@ class RemoteExtension(Extension):
             motd = str(message.get("motd", "")).strip()
             if motd:
                 self._log(f"motd: {motd}")
+        elif msg_type == protocol.MSG_KEY:
+            self._handle_inbound_key(message)
         else:
             self._log(f"unhandled message type: {msg_type}")
+
+    def _handle_inbound_key(self, message: dict) -> None:
+        """Synthesize a remote keystroke on the slave side.
+
+        NVDA Remote key frame:
+            {"type":"key","vk_code":<int>,"extended":<bool>,
+             "pressed":<bool>,"scan_code":<int>}
+
+        Only honoured when we're the host (a master should never
+        receive key frames; if it does, that's a misbehaving peer
+        and we drop the frame).
+        """
+
+        if self._current_role() != ROLE_HOST:
+            return
+        try:
+            vk_code = int(message.get("vk_code", 0))
+            extended = bool(message.get("extended", False))
+            pressed = bool(message.get("pressed", False))
+        except (TypeError, ValueError):
+            self._log(f"malformed key frame: {message!r}")
+            return
+
+        keysym = vk_to_keysym(vk_code, extended=extended)
+        if keysym == 0:
+            self._log(
+                f"unmapped VK code 0x{vk_code:x} "
+                f"(extended={extended}, pressed={pressed})"
+            )
+            return
+
+        if keysym in _LOCKING_KEYSYMS:
+            # See _LOCKING_KEYSYMS docstring: synthesizing these via
+            # XTest toggles X-level lock state which outlives Orca,
+            # and the most common offender (Caps Lock as NVDA's laptop
+            # modifier) sticks the slave uppercase after one press.
+            self._log(
+                f"refusing locking keysym 0x{keysym:x} "
+                f"(would toggle X lock state)"
+            )
+            return
+
+        GLib.idle_add(self._synthesize_key_idle_cb, keysym, pressed)
+
+    def _synthesize_key_idle_cb(self, keysym: int, pressed: bool) -> bool:
+        # Refuse chords that would fire our own commands. Without this,
+        # a remote master pressing e.g. Orca+Ctrl+R synthesizes through
+        # XTest, which Orca's own input listener picks up, and our
+        # open_settings command runs on the slave -- previously a
+        # blocking modal Gtk dialog. The check uses _pressed_keysyms
+        # (what we've synthesized PRESS for and not yet RELEASED), so
+        # by the time the alphabetic key of the chord arrives, the
+        # modifiers are already in the set.
+        if pressed and self._chord_matches_own_command(keysym):
+            self._log(
+                f"refusing own-command chord (keysym 0x{keysym:x}, "
+                f"held={sorted(self._pressed_keysyms)})"
+            )
+            return False
+
+        ok = False
+        try:
+            ok = bool(self.controller.synthesize_key_event(keysym, pressed))
+        except AttributeError:
+            self._log("controller has no synthesize_key_event (older Orca?)")
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"synthesize_key_event raised: {error}")
+        if ok:
+            # Track press/release pairing so a dropped connection mid-pair
+            # can't leak a held key into the X server.
+            if pressed:
+                self._pressed_keysyms.add(keysym)
+            else:
+                self._pressed_keysyms.discard(keysym)
+        return False  # one-shot
+
+    def _chord_matches_own_command(self, keysym: int) -> bool:
+        """True if synthesizing `keysym` PRESS would complete one of our chords.
+
+        Relies on `_pressed_keysyms` already containing the modifier
+        keysyms the master sent before the alphabetic key. NVDA Remote
+        forwards modifiers first, so by the time the letter/Page key
+        arrives the modifier set is populated; reversed orderings will
+        not match here and fall through to a normal synth, which is
+        acceptable: we'd rather miss a refusal than refuse a real key.
+        """
+
+        held = self._pressed_keysyms
+        if not (held & _ORCA_MOD_KEYSYMS):
+            return False
+        if keysym in _OWN_CTRL_CHORD_KEYSYMS and (held & _CTRL_KEYSYMS):
+            return True
+        if keysym in _OWN_ALT_CHORD_KEYSYMS and (held & _ALT_KEYSYMS):
+            return True
+        return False
+
+    def _release_held_keys(self) -> None:
+        """Synthesize RELEASE for any keysym we previously pressed.
+
+        Called from the asyncio thread (via _stop_transport) and from
+        disable(). Snapshots the set before iterating because each
+        idle callback mutates it; runs on the GLib main thread for the
+        same reason _synthesize_key_idle_cb does. Best-effort: if the
+        AT-SPI device is gone we swallow the error.
+        """
+
+        if not self._pressed_keysyms:
+            return
+        held = sorted(self._pressed_keysyms)
+        self._log(f"releasing {len(held)} held keysym(s) on shutdown")
+        for keysym in held:
+            GLib.idle_add(self._synthesize_key_idle_cb, keysym, False)
 
     def _current_role(self) -> str:
         role = str(self._settings.get(SETTING_ROLE, ROLE_CLIENT) or ROLE_CLIENT)

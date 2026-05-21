@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.4.1 -- 2026-05-21
+
+Host-mode safety fixes from a VM session that locked Orca into
+a stuck state requiring a forced power-off.
+
+- **Refuse locking keysyms.** `Caps_Lock`, `Num_Lock`, and
+  `Scroll_Lock` are no longer synthesized through XTest. XTest
+  treats a press of any locking keysym as a TOGGLE of the X
+  server's lock state, and the toggle outlives Orca itself
+  because it lives in the X server, not in Orca. NVDA Remote
+  forwards Caps Lock as the laptop-layout NVDA modifier; one
+  press locked the slave's caps lock on, after which every
+  alphabetic Orca chord stopped matching and an Orca restart
+  could not undo it (the lock was in X). Slave-side users still
+  use their own modifier locally.
+- **Refuse own-command chords in host mode.** When the master
+  sends an inbound key whose press would complete one of our own
+  command bindings (Orca+Ctrl+R, Orca+Ctrl+Page Up/Down,
+  Orca+Alt+Tab), the synth is dropped so the chord doesn't fire
+  the local settings dialog / connect / disconnect / switch-side.
+  The check uses `_pressed_keysyms` (what we've synthesized
+  PRESS for and not yet RELEASED), which works because NVDA
+  Remote forwards modifiers before the letter key.
+- **Non-blocking settings dialog.** Replaced the blocking
+  `Gtk.Dialog.run()` with a `response`-signal callback. A
+  remote-master-triggered open of the settings dialog can no
+  longer suspend the GLib main loop until a local user clicks
+  something. `build_settings_dialog` now takes an `on_result`
+  callback and returns the dialog immediately.
+- **Suppress reconnect re-announces.** The "Orca Remote
+  connected" / "...connected in host mode" announcement now
+  fires only on the first `channel_joined` per session intent.
+  Subsequent auto-reconnects (network blip, relay restart) are
+  silent; explicit Connect / Disconnect chords and settings
+  saves reset the gate so the next user-driven join is
+  announced. Previously a flaky link to nvdaremote.com produced
+  an announcement every ~30s (the backoff cap) which the master
+  heard as "repeating things over and over."
+
+## 0.4.0 -- 2026-05-21
+
+Robustness fixes from first host-mode VM test.
+
+- **Stuck-key safety net.** Host mode now tracks every keysym it
+  synthesizes a `PRESS` for, and on transport teardown or extension
+  disable it synthesizes the matching `RELEASE` for anything still
+  held. `Atspi.generate_keyboard_event` goes through XTEST, so a
+  press without a release outlives Orca itself; previously, a
+  dropped connection mid-pair could leave a key held until the
+  user force-killed the session. Releases are best-effort and
+  swallowed if the AT-SPI device is already gone.
+- **Auto-connect persistence.** Settings now carry an
+  `auto_connect` flag (default True). Orca+Ctrl+Page Up flips it
+  on; Orca+Ctrl+Page Down flips it off. On extension startup we
+  only dial the relay if the flag is True, so an explicit
+  disconnect followed by Orca restart stays offline until the user
+  asks to reconnect. Settings file at
+  `$XDG_DATA_HOME/orca/orca-remote-settings.json` will gain the
+  new key on first save.
+
 ## 0.3.0 -- 2026-05-20
 
 Stage 2 (Phase 1): host mode lands.
