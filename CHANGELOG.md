@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.2 -- 2026-05-21
+
+Second round of host-mode safety fixes after the 0.4.1 VM test.
+
+- **Autorepeat suppression for Orca-modifier chords.** NVDA Remote
+  forwards OS-level key autorepeat as a stream of PRESS frames,
+  one per repeat. Without dedupe, holding Insert+R rapid-fired
+  Orca's OCR "Recognizing." command and the slave looped until
+  release. The synth callback now drops a PRESS whose keysym is
+  already in `_pressed_keysyms` while any Orca modifier is held.
+  Plain-key autorepeat (typing, terminal scroll) is unaffected
+  because no Orca modifier is in the held set in that context.
+- **Tap-vs-modifier detection for Caps Lock / Num Lock /
+  Scroll Lock.** 0.4.1 dropped these unconditionally to stop the
+  XTest "press = toggle" foot-gun, which also killed legitimate
+  taps. Replaced with the behaviour NVDA itself uses internally:
+  a standalone tap (PRESS then RELEASE with no other key in
+  between) synthesizes a real PRESS+RELEASE toggle; a press-with-
+  chord (NVDA-laptop-modifier usage) is dropped on the RELEASE.
+  Pending-lock state lives in `_lock_press_pending` on the
+  asyncio thread and is cleared on transport teardown so a
+  dropped connection mid-press leaves nothing stale.
+
 ## 0.4.1 -- 2026-05-21
 
 Host-mode safety fixes from a VM session that locked Orca into
