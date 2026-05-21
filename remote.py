@@ -55,6 +55,7 @@ from .settings_dialog import (
 )
 from .keymap import vk_to_keysym
 from .protocol import CONNECTION_TYPE_MASTER, CONNECTION_TYPE_SLAVE
+from .remote_menu import build_remote_menu
 from .transport import RemoteTransport
 
 
@@ -356,21 +357,24 @@ class RemoteExtension(Extension):
 
     # ---- command registration -------------------------------------
     #
-    # Orca+Ctrl+R       open settings dialog
+    # Orca+Ctrl+R       open remote menu (state-aware list of actions)
     # Orca+Ctrl+PageUp  connect (no-op if already connected)
     # Orca+Ctrl+PageDn  disconnect (no-op if already disconnected)
-    # Orca+Alt+Tab      switch focus between host and remote machine
-    #                    (placeholder until host mode lands in Stage 2)
+    # Orca+Alt+Tab      master-side focus toggle (mute/unmute inbound)
+    #
+    # The menu surfaces every action that used to need its own chord
+    # (Settings, Connect, Disconnect, push clipboard, mute mirrors).
+    # The remaining standalone chords are kept for muscle memory.
 
     def _get_commands(self) -> list[Command]:
         ctrl = keybindings.ORCA_CTRL_MODIFIER_MASK
         alt = keybindings.ORCA_ALT_MODIFIER_MASK
         return [
             KeyboardCommand(
-                "orcaRemoteOpenSettingsHandler",
-                self.open_settings,
+                "orcaRemoteOpenMenuHandler",
+                self.open_menu,
                 self.GROUP_LABEL,
-                "Open Orca Remote settings",
+                "Open Orca Remote menu",
                 desktop_keybinding=keybindings.KeyBinding("r", ctrl),
                 laptop_keybinding=keybindings.KeyBinding("r", ctrl),
             ),
@@ -458,6 +462,34 @@ class RemoteExtension(Extension):
         """Show the non-blocking settings dialog; apply on OK."""
 
         build_settings_dialog(dict(self._settings), self._on_settings_result)
+        return True
+
+    def open_menu(self) -> bool:
+        """Show the state-aware remote menu (bound to Orca+Ctrl+R).
+
+        Items adapt to current connection / role / mirror state. Each
+        button's callback runs after the dialog destroys itself so a
+        chosen action can open its own follow-up dialog (e.g. the
+        settings window) without z-order issues.
+        """
+
+        state = {
+            "is_connected": self._transport is not None,
+            "role": self._current_role(),
+            "speech_muted": not self._mirror_speech,
+            "braille_muted": not self._mirror_braille,
+            "focus_on_remote": self._focus_on_remote,
+        }
+        actions: dict[str, Any] = {
+            "settings": self.open_settings,
+            "connect": self.open_settings,  # "Connect" path opens settings.
+            "disconnect": self.disconnect_session,
+            "push_clipboard": self.push_clipboard,
+            "toggle_speech": self.toggle_speech_mirror,
+            "toggle_braille": self.toggle_braille_mirror,
+            "toggle_focus": self.switch_side,
+        }
+        build_remote_menu(state, actions)
         return True
 
     def _on_settings_result(self, result: dict[str, Any] | None) -> None:

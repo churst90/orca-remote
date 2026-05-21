@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.4 -- 2026-05-21
+
+Remote menu UI. Orca+Ctrl+R now opens a state-aware Gtk dialog
+instead of going straight to Settings. Items shown depend on
+connection state, role, and mirror toggles:
+
+- **Settings…** — always shown; opens the existing settings dialog.
+- **Disconnect** — shown when connected.
+- **Push clipboard to remote** — shown when connected.
+- **Mute / Unmute outbound speech mirror** — host mode, when
+  connected. Wires `toggle_speech_mirror()`.
+- **Stop / Resume outbound braille mirror** — host mode, when
+  connected. Wires `toggle_braille_mirror()`.
+- **Mute / Unmute inbound remote speech** — client mode, when
+  connected. Wires the existing `switch_side()` (Orca+Alt+Tab
+  remains bound to the same action for muscle memory).
+- **Connect (opens settings)** — shown when disconnected. The
+  user's chosen convention is "connect = settings dialog" since
+  configuring the relay is how you make a first connection
+  succeed.
+
+Implementation in `remote_menu.py`: a non-blocking Gtk.Dialog with
+mnemonic-labeled buttons in a vertical Box. Heading line states
+current status (connected/disconnected, role) so a screen-reader
+user gets the picture on dialog activation. Each button records
+the chosen callback; on response the dialog destroys itself
+before invoking the callback (so a follow-up like Settings opens
+in a clean z-order).
+
 ## 0.5.3 -- 2026-05-21
 
 Host-mode braille mirroring (outbound).
