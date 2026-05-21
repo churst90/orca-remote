@@ -530,11 +530,11 @@ class RemoteExtension(Extension):
             if motd:
                 self._log(f"motd: {motd}")
         elif msg_type == protocol.MSG_KEY:
-            self._handle_inbound_key(message)
+            await self._handle_inbound_key(message)
         else:
             self._log(f"unhandled message type: {msg_type}")
 
-    def _handle_inbound_key(self, message: dict) -> None:
+    async def _handle_inbound_key(self, message: dict) -> None:
         """Synthesize a remote keystroke on the slave side.
 
         NVDA Remote key frame:
@@ -564,16 +564,30 @@ class RemoteExtension(Extension):
             )
             return
 
-        # Proactive speech interrupt on every PRESS. Orca's natural
-        # interrupt-on-key path (input_event.KeyboardEvent._present)
-        # should also fire when XTest delivers the synthesized event,
-        # but in practice -- especially under VM AT-SPI load with a
-        # backed-up speech-dispatcher queue -- the natural interrupt
-        # arrives too late and the user hears the previous utterance
-        # finish. Issuing the controller-side interrupt directly when
-        # the key arrives at the asyncio thread makes Control-to-
-        # silence and quick-arrow-to-interrupt feel like local Orca.
+        # Two-part interrupt on every PRESS:
+        #
+        # 1. MSG_CANCEL outbound to the master, BEFORE we synth. The
+        #    master's NVDA holds a speech queue of every speak message
+        #    we've forwarded; pressing Ctrl on the master cancels
+        #    NVDA's *local* speech but does nothing to that queue
+        #    because the wire never told the master to drain. NVDA
+        #    Remote v2.x's `cancel` message is exactly the signal to
+        #    drain it. Sending CANCEL inline (await rather than schedule)
+        #    keeps it strictly ordered before any speak we generate by
+        #    reacting to this same key.
+        # 2. Local SpeechManager.InterruptSpeech via GLib idle. Orca's
+        #    natural interrupt-on-key path (_present) should also fire
+        #    when XTest delivers the event we're about to synth, but
+        #    under VM AT-SPI load it can lag noticeably. This makes
+        #    the slave's own speech-dispatcher cancel deterministic.
         if pressed:
+            if self._transport is not None:
+                try:
+                    await self._transport.send(
+                        {"type": protocol.MSG_CANCEL},
+                    )
+                except Exception as error:  # pylint: disable=broad-except
+                    self._log(f"outbound CANCEL failed: {error}")
             GLib.idle_add(self._interrupt_speech_idle_cb)
 
         GLib.idle_add(self._synthesize_key_idle_cb, keysym, pressed)

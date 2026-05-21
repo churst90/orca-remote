@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.4 -- 2026-05-21
+
+Master-queue cancel: send MSG_CANCEL to the master on every inbound
+PRESS.
+
+Root cause this addresses: 0.4.3 added a proactive local interrupt
+on the slave, but the user is hearing speech through NVDA on the
+master, and NVDA holds its own speech queue of every `speak`
+message it has received. Cancelling the slave's speechd has no
+effect on that queue, so pressing Ctrl on the master and arrowing
+fast both left the queue draining at its own pace.
+
+NVDA Remote v2.x's `cancel` wire message is the signal to flush
+that queue. The slave now sends `{"type":"cancel"}` outbound
+*before* synthesizing the key, on every inbound PRESS. The
+existing local SpeechManager.InterruptSpeech idle callback stays
+in place so the slave's own speechd is also cancelled
+deterministically.
+
+Send is inline-`await`ed inside `_handle_inbound_key` (now async)
+so the CANCEL is strictly ordered ahead of any SPEAK we generate
+by reacting to the same key.
+
 ## 0.4.3 -- 2026-05-21
 
 Third round of host-mode fixes. Replaces the 0.4.2 tap-detection
