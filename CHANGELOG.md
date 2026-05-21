@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.7 -- 2026-05-21
+
+Real popup context menu (NVDA NVDA+N style).
+
+0.5.4 shipped the menu as a `Gtk.Dialog` of buttons -- functional
+but not what the user wanted. Replaced with `Gtk.Menu` so it's
+the screen-reader-familiar popup: arrow keys navigate, Enter
+activates, Escape (or click-outside) dismisses, no window frame.
+
+- `remote_menu.py` rewritten around `Gtk.Menu` + `Gtk.MenuItem`.
+  Header row (non-sensitive) gives the screen reader a "Orca
+  Remote: connected as host" announcement on open. Items are
+  the same set as 0.5.4 (Settings, Disconnect, Push clipboard,
+  mute/unmute speech / braille / inbound).
+- Popup positioning: prefer `popup_at_widget` against the active
+  toplevel (where a screen-reader user actually is on their
+  desktop) over `popup_at_pointer` (which is unreliable when the
+  pointer is parked off-screen on a multi-monitor setup); falls
+  back through pointer -> legacy `popup()`.
+- Singleton guard updated: while the menu is visible, a repeat
+  Orca+Ctrl+R is a no-op (prevents grab thrashing). `selection-
+  done` signal clears the ref so the next press opens fresh.
+- Chosen action runs on the next main-loop tick (`GLib.idle_add`)
+  so the menu finishes tearing down before any follow-up dialog
+  (e.g. Settings) opens -- avoids grab fighting and "dialog
+  appeared behind menu" symptoms.
+
 ## 0.5.6 -- 2026-05-21
 
 Singleton-dialog guard for settings and the remote menu.

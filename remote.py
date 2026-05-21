@@ -502,12 +502,22 @@ class RemoteExtension(Extension):
         double-press from the user or a remote master.
         """
 
+        # Popup-menu lifecycle: Gtk.Menu emits "selection-done" when
+        # it tears down (either an item was chosen or Escape / focus
+        # loss dismissed it). We hook that to clear the singleton
+        # ref. While the menu is up, a second Orca+Ctrl+R is a no-op
+        # (the existing popup is what the user actually wants).
         if self._menu_dialog is not None:
             try:
-                self._menu_dialog.present()
-                return True
+                if self._menu_dialog.get_visible():
+                    # Already up; the user's repeat keystroke is
+                    # effectively a no-op. Don't re-popup; that can
+                    # cause grab thrashing.
+                    return True
             except Exception:  # pylint: disable=broad-except
-                self._menu_dialog = None
+                pass
+            # Ref lingered but widget is gone -- clear and rebuild.
+            self._menu_dialog = None
 
         state = {
             "is_connected": self._transport is not None,
@@ -525,20 +535,14 @@ class RemoteExtension(Extension):
             "toggle_braille": self.toggle_braille_mirror,
             "toggle_focus": self.switch_side,
         }
-        # build_remote_menu destroys the dialog before invoking the
-        # selected action. Hook into the "destroy" signal (fires AFTER
-        # destroy is finished) so our singleton ref is cleared before
-        # the chosen callback runs and can re-enter open_menu.
         self._menu_dialog = build_remote_menu(state, actions)
 
-        def _clear_menu_ref(_widget: Any) -> None:
+        def _clear_menu_ref(_w: Any) -> None:
             self._menu_dialog = None
 
         try:
-            self._menu_dialog.connect("destroy", _clear_menu_ref)
+            self._menu_dialog.connect("selection-done", _clear_menu_ref)
         except Exception:  # pylint: disable=broad-except
-            # Should never happen on a freshly-built dialog, but if
-            # connect fails for any reason, defensively clear now.
             self._menu_dialog = None
         return True
 
