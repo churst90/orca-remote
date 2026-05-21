@@ -43,7 +43,7 @@ The second registers it; Orca prompts to enable it on next launch.
 
 ## Configure
 
-Once enabled, press **Orca + Shift + R** to open the settings dialog.
+Once enabled, press **Orca + Shift + M** to open the settings dialog.
 Fields:
 
 - **Relay host:** default `nvdaremote.com`.
@@ -63,7 +63,7 @@ Orca Remote pins the relay's certificate by SHA-256 fingerprint --
 there is no CA trust and no first-connect TOFU. On the first
 attempt with an empty fingerprint field, the connection is refused
 and Orca speaks the fingerprint it actually saw. Open the settings
-dialog again (Orca + Shift + R), paste that value into "Server
+dialog again (Orca + Shift + M), paste that value into "Server
 fingerprint", and save. Subsequent connects will succeed as long
 as the fingerprint still matches.
 

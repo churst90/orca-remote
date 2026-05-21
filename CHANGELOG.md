@@ -9,7 +9,7 @@ Initial release. Stage 1 MVP.
   TLS, `protocol_version` + `join` handshake, `speak` / `cancel`
   / `motd` / `channel_joined` / `client_joined` / `client_left`
   inbound handling).
-- Custom Gtk settings dialog bound to **Orca + Shift + R** (host,
+- Custom Gtk settings dialog bound to **Orca + Shift + M** (host,
   port, channel key, server fingerprint).
 - Server cert pinned by SHA-256 fingerprint; first-connect
   bootstrap surfaces the actual fingerprint to the user.

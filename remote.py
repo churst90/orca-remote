@@ -62,29 +62,39 @@ class RemoteExtension(Extension):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._transport: RemoteTransport | None = None
-        self._enabled: bool = False
         super().__init__()
 
     # ---- lifecycle -------------------------------------------------
+    #
+    # The framework calls set_up_commands() at load time (and again
+    # when the extension is re-enabled via the prefs panel, after
+    # clearing _disabled / _commands_initialized). disable() is
+    # called when the user toggles us off. There is no enable() hook
+    # in the base class, so all startup work hangs off
+    # set_up_commands.
 
-    def enable(self) -> None:
-        """Called by the loader when the extension is turned on."""
+    def set_up_commands(self) -> None:
+        """Register commands, then start the transport."""
 
-        self._enabled = True
-        self._log("enabling")
+        super().set_up_commands()
+        if self._disabled:
+            return
+        self._log("starting transport")
         self._start_loop_thread()
         self._restart_transport()
 
     def disable(self) -> None:
-        """Called by the loader when the extension is turned off."""
+        """Stop the transport, then deregister commands."""
 
-        self._enabled = False
         self._log("disabling")
         self._stop_transport()
         self._stop_loop_thread()
         super().disable()
 
     # ---- command registration -------------------------------------
+    #
+    # Orca+Shift+M opens the settings dialog. We deliberately avoid
+    # Orca+Shift+R (table-row read) and Orca+R (OCR toggle).
 
     def _get_commands(self) -> list[Command]:
         return [
@@ -94,10 +104,10 @@ class RemoteExtension(Extension):
                 self.GROUP_LABEL,
                 "Open Orca Remote settings",
                 desktop_keybinding=keybindings.KeyBinding(
-                    "r", keybindings.ORCA_SHIFT_MODIFIER_MASK,
+                    "m", keybindings.ORCA_SHIFT_MODIFIER_MASK,
                 ),
                 laptop_keybinding=keybindings.KeyBinding(
-                    "r", keybindings.ORCA_SHIFT_MODIFIER_MASK,
+                    "m", keybindings.ORCA_SHIFT_MODIFIER_MASK,
                 ),
             ),
         ]
@@ -116,7 +126,7 @@ class RemoteExtension(Extension):
         if changed:
             self._save_settings()
             self._say("Orca Remote settings saved.")
-            if self._enabled:
+            if not self._disabled:
                 self._restart_transport()
         return True
 
@@ -131,7 +141,7 @@ class RemoteExtension(Extension):
         # Reconnect if the change affects the transport. Stage 1
         # treats all four primary settings as connect-affecting.
         if key in (SETTING_HOST, SETTING_PORT, SETTING_CHANNEL, SETTING_FINGERPRINT):
-            if self._enabled:
+            if not self._disabled:
                 self._restart_transport()
 
     # ---- settings persistence -------------------------------------
