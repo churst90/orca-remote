@@ -18,17 +18,23 @@ This README covers install, configure, and the shortcuts. Deeper docs:
 
 ## Feature matrix
 
+Rows are the direction of the *data being mirrored*; "inbound" /
+"outbound" notes are added where the column heading alone is
+ambiguous.
+
 | Direction              | Speech | Braille          | Keys    | Clipboard |
 |------------------------|--------|------------------|---------|-----------|
 | Orca host → NVDA master| YES    | YES (Latin-only) | n/a     | OUT-OK    |
 | Orca host → Orca master| YES    | YES (Latin-only) | n/a     | OUT-OK    |
 | NVDA master → Orca host| n/a    | n/a              | YES     | IN-OK     |
-| Orca master → Orca host| n/a    | YES (inbound)    | PARTIAL | IN-OK     |
-| Orca master → NVDA host| n/a    | YES (inbound)    | PARTIAL | IN-OK     |
+| Orca master → Orca host| n/a    | YES (inbound)    | YES     | IN-OK     |
+| Orca master → NVDA host| n/a    | YES (inbound)    | YES     | IN-OK     |
 
-**YES** = implemented and exercised. **NO** = not yet implemented;
-gap is documented in [docs/architecture.md](docs/architecture.md)
-under "Deferred work."
+**YES** = implemented and exercised. **OUT-OK** / **IN-OK** = the
+clipboard sync direction is wired and tested. **(inbound)** in the
+Braille column means the master renders incoming cells from the
+slave onto a local BrlAPI display via the perf-branch
+`display_braille_text` hook.
 
 Notes:
 

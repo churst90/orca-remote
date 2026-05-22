@@ -45,13 +45,13 @@ self-hosted v2 relays both work.
 | `client_joined`     | both            | (Currently ignored; future: speak "peer joined".) |
 | `client_left`       | both            | Speak "peer left." |
 | `motd`              | both            | Log at debug level. |
-| `speak`             | client only     | Coalesce non-string sequence items, extract text, speak via `controller.present_message_internal`. Skipped when "focus on remote" is muted. |
+| `speak`             | client only     | Coalesce non-string sequence items, extract text, speak via `controller.present_message_internal`. Gated on `focus_on_remote AND NOT inbound_speech_muted`. |
 | `cancel`            | client only     | `controller.execute_command_internal("SpeechManager", "InterruptSpeech")`. |
 | `pause_speech`      | client only     | Same as cancel. (Screen-reader users want "stop", not "pause/resume".) |
 | `key`               | host only       | Synthesize via `controller.synthesize_key_event` after VK→keysym translation; dedup, refuse own chords, schedule outbound cancel to drain master's queue. |
 | `set_clipboard_text`| both            | `controller.set_clipboard_text`; brief spoken "peer pushed clipboard (N chars)" cue (length only — could be a password). |
-| `set_braille_info`  | both            | Log only. Rendering inbound braille onto a local display needs another perf-branch hook (see [architecture.md](architecture.md) → "Deferred work"). |
-| `display`           | both            | Log only (same reason as `set_braille_info`). |
+| `set_braille_info`  | both            | Track peer's `numCells` in `_peer_braille_cells` for informational use. |
+| `display`           | client only     | Render incoming cells as Unicode braille block characters (U+2800 + cell_byte) via `controller.display_braille_text`. Same gating as `speak` (`focus_on_remote AND NOT inbound_speech_muted`). Shipped 0.6.1. |
 | `nvda_not_connected`| both            | Constant defined, no current handler. |
 
 Anything not in the table is logged as "unhandled message type: ..."

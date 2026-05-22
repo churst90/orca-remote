@@ -15,8 +15,8 @@ debugging, see [troubleshooting.md](troubleshooting.md).
 | `keymap.py` | Windows VK → X11 keysym table. Pure data + lookup. |
 | `braille_table.py` | US computer braille ASCII → cell byte table + Unicode braille block passthrough. |
 | `settings_dialog.py` | Non-blocking Gtk dialog for relay host / port / channel / fingerprint / role. |
-| `remote_menu.py` | Non-blocking Gtk dialog: the state-aware Orca+Ctrl+R menu. |
 | `__init__.py` | Thin re-export so Orca's loader can find `RemoteExtension`. |
+| `vendor/orca_ext_utils/` | Vendored from <https://github.com/churst90/orca-ext-utils>; we only use `keyboard_grab.KeysetGrab`. See `vendor/UPDATE.md` for sync notes. |
 
 ## Threads
 
@@ -212,14 +212,12 @@ correctly; non-Latin scripts come through as blank cells. A
 liblouis-backed translation can drop in behind `text_to_cells`
 without changing the wire layer.
 
-## Deferred work
+## Master-side key forwarding (Orca master → slave)
 
-Items the user has explicitly asked for that aren't in current
-releases, with the design constraint:
-
-### Master-side key forwarding (Orca master → slave)
-
-**Implemented across two releases. 0.7.0 = full system-level consume.**
+**Implemented across three releases.** End-to-end tested over a
+real relay with an Orca master controlling an NVDA host (and the
+reverse). 0.6.0 added the forwarding hook, 0.7.0 added full
+system-level consume, 0.8.0 added the local-command bypass.
 
 Both designs originally considered turned out to be necessary --
 the right architecture is to combine them:
@@ -246,7 +244,7 @@ still happens through `_on_keyboard_event` (which fires from
 input_event_manager regardless of whether the event was
 AT-SPI-grabbed). The grab's only job is the focused-app block.
 
-#### Local-command bypass (0.8.0)
+### Local-command bypass (0.8.0)
 
 The user still needs to fire orca-remote's own commands locally
 while master-mode forwarding is active. 0.6.x / 0.7.x used F11 as
@@ -297,7 +295,7 @@ owns this" from "someone else owns this." Resolvable later by
 querying the controller's command registry or surfacing the
 bypass list as a setting.
 
-#### Compositor coverage
+### Compositor coverage
 
 | Display server | Behavior |
 |---|---|
@@ -310,14 +308,10 @@ The user gets a one-line log message at grab time showing the
 held/refused split, so partial coverage is observable rather
 than silent.
 
-### Inbound braille rendering (master plays remote braille)
+## Deferred work
 
-The host→master direction works (master's NVDA viewer or, in
-principle, another Orca master, can display incoming cells). But
-to render an incoming braille frame onto a local BrlAPI display
-on a master, we'd need a "push braille text" API on the
-controller that bypasses `braille.refresh`'s region-stack walk.
-Another perf-branch hook. Tracked.
+Items the user has explicitly asked for that aren't in current
+releases, with the design constraint.
 
 ### File transfer
 
