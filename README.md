@@ -6,7 +6,7 @@ extension (`.orca-ext`). Bidirectional speech mirroring, host-mode
 key injection (NVDA master → Orca slave), bidirectional clipboard
 sync, and host-mode braille mirroring.
 
-This README covers install, configure, and the menu. Deeper docs:
+This README covers install, configure, and the shortcuts. Deeper docs:
 
 - [docs/architecture.md](docs/architecture.md) — threads, message
   flow, why the design is the way it is.
@@ -36,13 +36,17 @@ Notes:
   ASCII→cell table, so English text renders correctly on a master's
   braille viewer. Non-Latin scripts come through as blank cells.
 - **Master-side key forwarding** (Orca user typing on the Linux
-  master to control a Windows / Linux slave) is **PARTIAL** as of
-  0.6.0. Keys are forwarded to the slave and Orca's own dispatch
-  is skipped, but the keys ALSO reach the focused application on
-  the master (AT-SPI's true consume needs per-keysym grabs, which
-  is tracked as a follow-up). While forwarding is active, plain
-  **F11** is the escape: it fires the "focus on local" toggle
-  without going on the wire. Matches NVDA Remote's F11 convention.
+  master to control a Windows / Linux slave) ships full system-
+  level consume as of 0.7.0 via the vendored
+  [orca-ext-utils](https://github.com/churst90/orca-ext-utils)
+  KeysetGrab: forwarded keys reach the slave only, not also the
+  focused local app. Partial coverage on Wayland compositors that
+  refuse some AT-SPI grabs (the refused count goes to the debug
+  log). While forwarding is active, the five orca-remote command
+  chords (see "Shortcuts" below) bypass forwarding and dispatch
+  locally so the user can always quit / mute / switch sides; all
+  other Orca / NVDA chords (Insert+Down, Insert+T, etc.) still
+  forward to the remote so its screen reader can act on them.
 - **File transfer** is not in scope — the v2 wire has no
   file-transfer message, and a custom one would lose NVDA interop.
 
@@ -70,41 +74,31 @@ and produces `remote.orca-ext` in the current directory. The
 `orca --install-extension` step registers it; Orca prompts to enable
 it on the next launch.
 
-## The remote menu
+## Shortcuts
 
-The extension binds **Orca + Ctrl + R** to open a state-aware menu.
-Items appear/disappear based on whether you're connected, whether
-you're a host or a client, and the current mirror toggles. The
-menu always has a "Close" button to exit without doing anything.
+The 0.8.0 release dropped the popup menu in favor of direct
+keyboard shortcuts. All five chords work while master-mode key
+forwarding is active (they're on the bypass list so they dispatch
+locally instead of being forwarded to the remote).
 
-Items by state:
-
-| Item                           | When shown                       |
-|--------------------------------|----------------------------------|
-| Settings…                      | always                           |
-| Disconnect                     | connected                        |
-| Push clipboard to remote       | connected                        |
-| Mute / Unmute speech mirror    | connected, role = host           |
-| Stop / Resume braille mirror   | connected, role = host           |
-| Mute / Unmute inbound speech   | connected, role = client         |
-| Connect (opens settings)       | not connected                    |
-
-The "Connect" item deliberately opens the settings dialog: on a
-first run you need to configure the relay anyway, and on subsequent
-runs saving settings re-dials.
-
-## Standalone chords (kept for muscle memory)
-
-- **Orca + Ctrl + R** — open the remote menu.
-- **Orca + Ctrl + Page Up** — connect (or settings, if unconfigured).
+- **Orca + Ctrl + R** — open the settings dialog.
+- **Orca + Ctrl + M** — client only; toggle inbound mute. Drops
+  speech AND braille from the slave without dropping the
+  connection ("stop hearing them move around while I work").
+  Independent of the focus toggle: a muted state persists across
+  Orca+Alt+Tab toggles.
+- **Orca + Ctrl + Page Up** — connect (or open settings if no
+  relay configured yet).
 - **Orca + Ctrl + Page Down** — disconnect.
-- **Orca + Alt + Tab** — client only; toggle "focus on remote"
-  (mutes inbound speech without dropping the connection).
+- **Orca + Alt + Tab** — client only; toggle "focus on remote."
+  Activates / releases the KeysetGrab and the inbound speech
+  pipeline together. Announcement includes the mute state on the
+  way back to remote: "focused on remote machine, muted" if
+  mute is still set.
 
 ## Configure
 
-Settings dialog fields (from the "Settings…" menu item, or
-Orca+Ctrl+R → Settings…):
+Settings dialog fields (Orca+Ctrl+R opens it):
 
 - **Relay host** — default `nvdaremote.com`.
 - **Relay port** — default `6837`.
@@ -128,8 +122,8 @@ Orca Remote pins the relay's certificate by SHA-256 fingerprint —
 no CA trust, no first-connect TOFU. On the first attempt with an
 empty fingerprint field, the connection is refused and Orca speaks
 the fingerprint it actually saw AND copies it to your clipboard.
-Open the menu → Settings…, focus "Server fingerprint", and paste
-with Control + V.
+Press Orca+Ctrl+R, focus "Server fingerprint", and paste with
+Control + V.
 
 If the relay rotates its certificate later, you'll get the same
 "server fingerprint did not match" announcement — verify the new

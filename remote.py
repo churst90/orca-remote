@@ -55,7 +55,6 @@ from .settings_dialog import (
 )
 from .keymap import forwardable_keysyms, keysym_to_vk, vk_to_keysym
 from .protocol import CONNECTION_TYPE_MASTER, CONNECTION_TYPE_SLAVE
-from .remote_menu import build_remote_menu
 from .transport import RemoteTransport
 
 # Vendored orca-ext-utils (see vendor/UPDATE.md for sync notes). The
@@ -85,12 +84,16 @@ _ORCA_MOD_KEYSYMS: frozenset[int] = frozenset({
 _CTRL_KEYSYMS: frozenset[int] = frozenset({0xffe3, 0xffe4})
 _ALT_KEYSYMS: frozenset[int] = frozenset({0xffe9, 0xffea})
 
-# Keysyms that, when pressed while Orca-mod + Ctrl are held, would fire
-# one of our own commands (open_settings, connect, disconnect). Refused
-# in host mode so a remote master can't pop our settings dialog or
-# bounce the transport.
+# Keysyms that, when pressed while Orca-mod + Ctrl are held, fire one
+# of our own commands. Used in two places:
+#   1. Host (slave) side: refuses inbound synthesis so a remote master
+#      can't pop our settings dialog or bounce the transport.
+#   2. Master (client) side: skips forwarding so the user can fire
+#      orca-remote's own commands locally even while focused on remote
+#      (the bypass list, replacing 0.6.x's F11 escape).
 _OWN_CTRL_CHORD_KEYSYMS: frozenset[int] = frozenset({
     0x72,    # XK_r          -> open_settings
+    0x6d,    # XK_m          -> mute_inbound_toggle
     0xff55,  # XK_Page_Up    -> connect
     0xff56,  # XK_Page_Down  -> disconnect_session
     0xff9a,  # XK_KP_Page_Up
@@ -100,13 +103,11 @@ _OWN_ALT_CHORD_KEYSYMS: frozenset[int] = frozenset({
     0xff09,  # XK_Tab        -> switch_side
 })
 
-# F11 is the master-side "send keys back to local" escape: when
-# focus_on_remote is True we forward every key, so the user has no
-# way to fire our Orca+Alt+Tab toggle (its component keys go on
-# the wire). Plain F11 with no modifiers is the universal escape
-# hatch -- consumed locally, fires switch_side, never forwarded.
-# Chosen to match NVDA Remote's F11 "send keys" convention.
-_FORWARD_ESCAPE_KEYSYM: int = 0xffc8  # XK_F11
+# AT-SPI key-event modifier bit positions (standard X11 layout).
+# Used by the master-side bypass check to distinguish our own command
+# chords from regular typing that should be forwarded to the remote.
+_AT_SPI_MOD_CTRL: int = 0x04
+_AT_SPI_MOD_ALT: int = 0x08
 
 
 def _settings_path() -> str:
@@ -131,13 +132,31 @@ class RemoteExtension(Extension):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._transport: RemoteTransport | None = None
-        # Master-only "focus" flag: when True, inbound speak messages
-        # from the slave are spoken locally; when False, they are
-        # dropped so the master can use their own machine without the
-        # remote stream chattering over the top. Toggled by
-        # Orca+Alt+Tab. Has no effect when we're the host (a slave
-        # never receives speak messages it needs to mute).
-        self._focus_on_remote: bool = True
+        # Master-only "focus" flag: when True, the master is driving
+        # the remote machine -- keystrokes get forwarded (via
+        # KeysetGrab + subscribe_keyboard_event) AND inbound speech
+        # is spoken locally. When False, keys go to the master's own
+        # apps and inbound speech is dropped. Toggled by Insert+Alt+Tab.
+        # Default False so the extension loads in a known-quiet state;
+        # the first switch_side enables both grab + hearing together.
+        # Has no effect when we're the host (a slave never receives
+        # speak messages it needs to mute and never grabs keyboard).
+        self._focus_on_remote: bool = False
+        # Master-only mute: independent of focus_on_remote. When True,
+        # inbound speech is dropped regardless of focus state. Lets
+        # the user keep the connection up + the focus on remote (so
+        # keystrokes still forward) while silencing the speech feed --
+        # "stop hearing them move around while I work." Toggled by
+        # Insert+Ctrl+M.
+        self._inbound_speech_muted: bool = False
+        # Master-only: how many Orca-modifier keys (Insert / Caps_Lock)
+        # are currently held. Counter (not bool) so two Orca-mod keys
+        # held together don't double-decrement. Read by the bypass
+        # check in _on_keyboard_event to decide whether the incoming
+        # chord is one of our local commands (which dispatch locally
+        # via Orca) versus regular typing (which gets forwarded so the
+        # remote NVDA/Orca can act on it).
+        self._master_orca_mod_held: int = 0
         # Host-side: keysyms we've synthesized PRESS for but not yet
         # RELEASE. If the transport drops between a press/release pair
         # the X server would otherwise believe the key is still held,
@@ -181,12 +200,11 @@ class RemoteExtension(Extension):
         # menu items flip these without restarting the transport.
         self._mirror_speech: bool = True
         self._mirror_braille: bool = True
-        # Singleton dialog refs. Set before show_all() so a rapid
-        # second Orca+Ctrl+R refocuses the existing window instead of
-        # stacking duplicates (pre-0.5.6 behavior was that each press
-        # opened another settings/menu dialog). Cleared by the dialog
-        # response callback before destroy.
-        self._menu_dialog: Any = None
+        # Singleton settings-dialog ref. open_settings always destroys
+        # and rebuilds rather than presenting an existing dialog --
+        # focus-loss on the existing one tends to leave it alive but
+        # unreachable on marco/wayland-flagged sessions, and present()
+        # doesn't reliably re-raise. Destroy-rebuild is predictable.
         self._settings_dialog: Any = None
         # KeysetGrab active while master-mode forwarding is on. When
         # set, the forwardable-keysym set is grabbed at the AT-SPI
@@ -344,17 +362,26 @@ class RemoteExtension(Extension):
         perspective (Orca skips event.process() for this event).
 
         Behavior:
+        - Track Orca-modifier (Insert / Caps_Lock) press/release into
+          self._master_orca_mod_held so the bypass check below can tell
+          a local Orca chord from regular typing. The modifier keys
+          themselves are still forwarded so the remote screen reader
+          sees Insert/Caps_Lock state come through.
         - Inactive unless role=client AND _focus_on_remote AND a
           live transport. Otherwise returns False (passthrough).
-        - F11 alone is the universal escape: while forwarding is
-          active, F11 fires switch_side() to flip _focus_on_remote
-          back off, and is itself consumed (never goes on the wire).
-          Chosen to match NVDA Remote's "send keys" convention.
-        - Anything else maps via keysym_to_vk and is sent as an
+        - Bypass-chord list: when the user holds Orca-mod and presses
+          one of our own command chords (Insert+Ctrl+R / Ctrl+M /
+          Ctrl+PgUp / Ctrl+PgDn / Alt+Tab), return False so Orca
+          dispatches the binding locally. The component modifier
+          keystrokes (Insert, Ctrl, Alt) are STILL forwarded; only
+          the trigger keysym is suppressed. The remote screen reader
+          sees the modifier prefix without the trigger and treats it
+          as a no-op.
+        - Everything else maps via keysym_to_vk and is sent as an
           NVDA Remote v2 `key` frame with (vk_code, extended,
           pressed). Unmapped keysyms (keysym_to_vk returns (0, ...))
-          are NOT consumed -- Orca processes them normally so an
-          exotic key isn't silently swallowed.
+          pass through to Orca so an exotic key isn't silently
+          dropped.
 
         Full-consume model (0.7.0+): while focused-on-remote is
         active, `_enable_master_grab` registers a KeysetGrab over
@@ -373,7 +400,20 @@ class RemoteExtension(Extension):
         consume for the unaccepted subset).
         """
 
-        # Cheap guards first so non-forwarding sessions pay nothing.
+        # Track Orca-mod hold state. Counter (not bool) so two
+        # Orca-mod keys held together (Insert + KP_Insert) balance.
+        # Fall through to the normal forwarding path: the Orca-mod
+        # keys themselves SHOULD reach the remote so its screen
+        # reader sees Insert/Caps_Lock in its own modifier state.
+        if keysym in _ORCA_MOD_KEYSYMS:
+            if pressed:
+                self._master_orca_mod_held += 1
+            else:
+                self._master_orca_mod_held = max(
+                    0, self._master_orca_mod_held - 1,
+                )
+
+        # Cheap guards: non-forwarding sessions pay no further cost.
         if self._current_role() != ROLE_CLIENT:
             return False
         if not self._focus_on_remote:
@@ -381,16 +421,13 @@ class RemoteExtension(Extension):
         if self._transport is None:
             return False
 
-        # F11 escape: fire switch_side on press, consume both press
-        # and release so neither leaks to the wire or the local app's
-        # F11 handler (e.g. browser fullscreen).
-        if keysym == _FORWARD_ESCAPE_KEYSYM:
-            if pressed:
-                # Defer switch_side to the next main-loop tick so we
-                # return from the handler before mutating state that
-                # this same dispatch cycle is observing.
-                GLib.idle_add(self._switch_side_idle_cb)
-            return True
+        # Bypass: if the user is holding Orca-mod and this is one of
+        # our own command chords, don't forward -- Orca's dispatcher
+        # will fire the matching binding locally. Everything else
+        # (including Insert+Down for sayAll on the remote, etc.) is
+        # forwarded so the remote screen reader can act on it.
+        if self._is_local_bypass_chord(keysym, modifiers):
+            return False
 
         vk_code, extended = keysym_to_vk(keysym)
         if vk_code == 0:
@@ -410,12 +447,28 @@ class RemoteExtension(Extension):
         )
         return True
 
-    def _switch_side_idle_cb(self) -> bool:
-        try:
-            self.switch_side()
-        except Exception as error:  # pylint: disable=broad-except
-            self._log(f"switch_side from F11 escape failed: {error}")
-        return False  # one-shot
+    def _is_local_bypass_chord(self, keysym: int, modifiers: int) -> bool:
+        """True iff (Orca-mod held) + (modifier) + (keysym) names a local command.
+
+        Master-side bypass for orca-remote's own keybindings. When
+        the user holds Insert and presses Ctrl+R / Ctrl+M / Ctrl+PgUp
+        / Ctrl+PgDn / Alt+Tab, we don't want to forward those to the
+        remote -- they're local control commands and should fire
+        Orca's binding for the registered handler instead.
+
+        Modifier bits come from the AT-SPI event: Ctrl = 0x04,
+        Alt = 0x08. The Orca-modifier (Insert / Caps_Lock) isn't a
+        true X11 modifier bit; we track its press/release ourselves
+        in _master_orca_mod_held.
+        """
+
+        if self._master_orca_mod_held == 0:
+            return False
+        if keysym in _OWN_CTRL_CHORD_KEYSYMS and (modifiers & _AT_SPI_MOD_CTRL):
+            return True
+        if keysym in _OWN_ALT_CHORD_KEYSYMS and (modifiers & _AT_SPI_MOD_ALT):
+            return True
+        return False
 
     def _on_braille_emitted(self, text: str, cursor_cell: int) -> None:
         """Forward Orca's braille refresh to the remote master.
@@ -502,26 +555,36 @@ class RemoteExtension(Extension):
 
     # ---- command registration -------------------------------------
     #
-    # Orca+Ctrl+R       open remote menu (state-aware list of actions)
+    # Orca+Ctrl+R       open Orca Remote settings dialog
+    # Orca+Ctrl+M       toggle inbound speech mute (master-side)
     # Orca+Ctrl+PageUp  connect (no-op if already connected)
     # Orca+Ctrl+PageDn  disconnect (no-op if already disconnected)
-    # Orca+Alt+Tab      master-side focus toggle (mute/unmute inbound)
+    # Orca+Alt+Tab      switch_side -- toggle focus_on_remote (grab +
+    #                   hearing together); replaces the 0.7.x F11 escape
     #
-    # The menu surfaces every action that used to need its own chord
-    # (Settings, Connect, Disconnect, push clipboard, mute mirrors).
-    # The remaining standalone chords are kept for muscle memory.
+    # The menu-based action list was removed in 0.8.0; the bypass-chord
+    # mechanism in _on_keyboard_event ensures these five chords still
+    # reach Orca's dispatcher even while master-mode forwarding is on.
 
     def _get_commands(self) -> list[Command]:
         ctrl = keybindings.ORCA_CTRL_MODIFIER_MASK
         alt = keybindings.ORCA_ALT_MODIFIER_MASK
         return [
             KeyboardCommand(
-                "orcaRemoteOpenMenuHandler",
-                self.open_menu,
+                "orcaRemoteOpenSettingsHandler",
+                self.open_settings,
                 self.GROUP_LABEL,
-                "Open Orca Remote menu",
+                "Open Orca Remote settings",
                 desktop_keybinding=keybindings.KeyBinding("r", ctrl),
                 laptop_keybinding=keybindings.KeyBinding("r", ctrl),
+            ),
+            KeyboardCommand(
+                "orcaRemoteMuteInboundHandler",
+                self.mute_inbound_toggle,
+                self.GROUP_LABEL,
+                "Toggle Orca Remote inbound mute",
+                desktop_keybinding=keybindings.KeyBinding("m", ctrl),
+                laptop_keybinding=keybindings.KeyBinding("m", ctrl),
             ),
             KeyboardCommand(
                 "orcaRemoteConnectHandler",
@@ -584,18 +647,22 @@ class RemoteExtension(Extension):
     def switch_side(self) -> bool:
         """Toggle the master's focus between remote and local.
 
-        Client (master) only. While focused on remote, inbound
-        speech is spoken; while focused on local, it is dropped so
-        the master can use their own machine without the remote
-        stream chattering over the top. Connection stays up either
-        way. On the slave (host), this is a silent no-op -- matching
-        how NVDA Remote ignores F11-equivalents on the controlled
-        machine.
+        Client (master) only. Entering focused-on-remote mode:
+          - activates KeysetGrab (forwarded keys stop hitting local apps)
+          - inbound speech becomes audible (unless _inbound_speech_muted)
+        Leaving focused-on-remote mode:
+          - releases the KeysetGrab
+          - inbound speech is dropped regardless of mute state
 
-        Side effect: entering focused-on-remote mode activates a
-        KeysetGrab over the forwardable keysym set so the focused
-        local app stops receiving keys we forward on the wire.
-        Leaving the mode releases the grab.
+        Bound to Insert+Alt+Tab. On the slave (host), this is a
+        silent no-op -- matching how NVDA Remote ignores F11-
+        equivalents on the controlled machine.
+
+        Announcement always reflects current mute state when
+        entering remote so the user knows whether they'll hear
+        anything ("focused on remote machine, muted" vs "focused
+        on remote machine"). Leaving doesn't include mute because
+        the mute flag is independent and persists across toggles.
         """
 
         if self._current_role() != ROLE_CLIENT:
@@ -604,10 +671,31 @@ class RemoteExtension(Extension):
         self._focus_on_remote = not self._focus_on_remote
         if self._focus_on_remote:
             self._enable_master_grab()
-            self._say("Orca Remote: focused on remote machine.")
+            if self._inbound_speech_muted:
+                self._say("Orca Remote: focused on remote machine. Muted.")
+            else:
+                self._say("Orca Remote: focused on remote machine.")
         else:
             self._disable_master_grab()
             self._say("Orca Remote: focused on local machine.")
+        return True
+
+    def mute_inbound_toggle(self) -> bool:
+        """Toggle the master-side inbound-speech mute. Bound to Insert+Ctrl+M.
+
+        Independent of focus_on_remote: muting while focused-on-local
+        is a no-op for hearing (we already weren't), but the flag
+        sticks so the next switch_side back to remote stays quiet.
+        Client only; host has no inbound speech to mute (silent no-op).
+        """
+
+        if self._current_role() != ROLE_CLIENT:
+            return True
+        self._inbound_speech_muted = not self._inbound_speech_muted
+        if self._inbound_speech_muted:
+            self._say("Orca Remote: remote muted.")
+        else:
+            self._say("Orca Remote: remote unmuted.")
         return True
 
     def _enable_master_grab(self) -> None:
@@ -645,10 +733,14 @@ class RemoteExtension(Extension):
         grab.register(lambda _event: True)
         self._master_grab = grab
         held = len(keysyms) * len(grab._modifier_combos) - len(grab.failed_keysyms)
-        self._log(
-            f"master grab active: {held} grabs held, "
-            f"{len(grab.failed_keysyms)} refused"
-        )
+        refused = len(grab.failed_keysyms)
+        self._log(f"master grab active: {held} grabs held, {refused} refused")
+        # Partial coverage is common on Wayland compositors that don't
+        # fully honor AT-SPI key grabs. The refused count goes to the
+        # log but NOT to speech -- speaking it on every switch_side
+        # was too chatty (and the count varies between activations
+        # depending on transient grab-table state, which is confusing).
+        # Users who want to know their coverage can grep the log.
 
     def _disable_master_grab(self) -> None:
         """Release the master-mode KeysetGrab if one is held."""
@@ -662,84 +754,24 @@ class RemoteExtension(Extension):
         self._master_grab = None
 
     def open_settings(self) -> bool:
-        """Show the non-blocking settings dialog; apply on OK.
+        """Show the settings dialog. Bound to Insert+Ctrl+R.
 
-        Singleton: if a settings dialog is already open, refocus it
-        instead of stacking a duplicate. Pre-0.5.6 behavior was that
-        rapid Orca+Ctrl+R presses (or a remote master synthesizing
-        the chord) opened a fresh dialog each time, which the user
-        had to dismiss one by one.
+        Destroy-and-rebuild rather than present-existing: focus loss
+        on the existing dialog tends to leave it alive but unreachable
+        on marco / wayland-flagged sessions, and Gtk.Window.present()
+        doesn't reliably re-raise it. Destroying first guarantees the
+        user sees a freshly-mapped, focused window every time.
         """
 
         if self._settings_dialog is not None:
             try:
-                self._settings_dialog.present()
-            except Exception:  # pylint: disable=broad-except
-                # Dialog dead but ref not yet cleared; fall through
-                # and build a new one.
-                self._settings_dialog = None
-        if self._settings_dialog is None:
-            self._settings_dialog = build_settings_dialog(
-                dict(self._settings), self._on_settings_result,
-            )
-        return True
-
-    def open_menu(self) -> bool:
-        """Show the state-aware remote menu (bound to Orca+Ctrl+R).
-
-        Items adapt to current connection / role / mirror state. Each
-        button's callback runs after the dialog destroys itself so a
-        chosen action can open its own follow-up dialog (e.g. the
-        settings window) without z-order issues.
-
-        Singleton: a second Orca+Ctrl+R refocuses the existing menu
-        instead of stacking. The menu is short-lived (user picks an
-        item or hits Close), so this is mostly a guard against rapid
-        double-press from the user or a remote master.
-        """
-
-        # Popup-menu lifecycle: Gtk.Menu emits "selection-done" when
-        # it tears down (either an item was chosen or Escape / focus
-        # loss dismissed it). We hook that to clear the singleton
-        # ref. While the menu is up, a second Orca+Ctrl+R is a no-op
-        # (the existing popup is what the user actually wants).
-        if self._menu_dialog is not None:
-            try:
-                if self._menu_dialog.get_visible():
-                    # Already up; the user's repeat keystroke is
-                    # effectively a no-op. Don't re-popup; that can
-                    # cause grab thrashing.
-                    return True
+                self._settings_dialog.destroy()
             except Exception:  # pylint: disable=broad-except
                 pass
-            # Ref lingered but widget is gone -- clear and rebuild.
-            self._menu_dialog = None
-
-        state = {
-            "is_connected": self._transport is not None,
-            "role": self._current_role(),
-            "speech_muted": not self._mirror_speech,
-            "braille_muted": not self._mirror_braille,
-            "focus_on_remote": self._focus_on_remote,
-        }
-        actions: dict[str, Any] = {
-            "settings": self.open_settings,
-            "connect": self.open_settings,  # "Connect" path opens settings.
-            "disconnect": self.disconnect_session,
-            "push_clipboard": self.push_clipboard,
-            "toggle_speech": self.toggle_speech_mirror,
-            "toggle_braille": self.toggle_braille_mirror,
-            "toggle_focus": self.switch_side,
-        }
-        self._menu_dialog = build_remote_menu(state, actions)
-
-        def _clear_menu_ref(_w: Any) -> None:
-            self._menu_dialog = None
-
-        try:
-            self._menu_dialog.connect("selection-done", _clear_menu_ref)
-        except Exception:  # pylint: disable=broad-except
-            self._menu_dialog = None
+            self._settings_dialog = None
+        self._settings_dialog = build_settings_dialog(
+            dict(self._settings), self._on_settings_result,
+        )
         return True
 
     def _on_settings_result(self, result: dict[str, Any] | None) -> None:
@@ -940,13 +972,16 @@ class RemoteExtension(Extension):
     async def _on_message(self, message: dict) -> None:
         msg_type = message.get("type")
         if msg_type == protocol.MSG_SPEAK:
-            # Only speak inbound utterances when we're a client AND
-            # the master is currently focused on the remote session.
-            # Toggling focus to local (Orca+Alt+Tab) silences the
-            # remote stream without dropping the connection.
+            # Only speak inbound utterances when we're a client, the
+            # master is focused on the remote session, and the user
+            # hasn't muted the remote (Insert+Ctrl+M). Mute is
+            # independent of focus so a muted state persists across
+            # switch_side toggles -- coming back to remote stays quiet
+            # until the user explicitly unmutes.
             if (
                 self._current_role() == ROLE_CLIENT
                 and self._focus_on_remote
+                and not self._inbound_speech_muted
             ):
                 text, dropped = protocol.extract_speech_text(message)
                 if dropped:
@@ -1001,12 +1036,15 @@ class RemoteExtension(Extension):
             # exactly the dot pattern the peer intended.
             #
             # Client mode only, and only while the master is
-            # "focused on remote" (_focus_on_remote) -- the same
-            # toggle that mutes inbound speech also mutes inbound
-            # braille for consistency.
+            # focused-on-remote AND not muted. Mute is meant for
+            # speech but inbound braille follows the same gate for
+            # consistency -- if the user can't hear the remote, the
+            # remote braille shouldn't bleed onto their display
+            # either.
             if (
                 self._current_role() == ROLE_CLIENT
                 and self._focus_on_remote
+                and not self._inbound_speech_muted
             ):
                 cells = message.get("cells") or []
                 if isinstance(cells, list) and cells:

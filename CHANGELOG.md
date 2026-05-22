@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.8.0 -- 2026-05-22
+
+UX rework: replace the menu/dialog with direct shortcuts; replace
+the F11 escape with an explicit bypass-chord list so the user can
+still send arbitrary NVDA commands (Insert+Down, etc.) to the remote
+while only orca-remote's own command chords stay local.
+
+### Removed
+
+- `remote_menu.py` and the Gtk popup/dialog landing page. The
+  0.7.1 Gtk.Window dialog worked but felt inconsistent (focus
+  shifts left it stranded; subsequent Insert+Ctrl+R no-op'd).
+- F11 escape (`_FORWARD_ESCAPE_KEYSYM`). Replaced by the
+  bypass-chord mechanism described below.
+- Host-mode mirror toggles (`toggle_speech_mirror` /
+  `toggle_braille_mirror`). Were only reachable through the
+  menu; the underlying methods remain available for future
+  shortcut bindings if requested.
+
+### Added
+
+- **Insert+Ctrl+M -- master-side inbound mute.** New
+  `_inbound_speech_muted` flag (default False), independent of
+  `_focus_on_remote`. When muted, inbound speech AND braille are
+  dropped regardless of focus state. Lets the user keep the
+  connection up and forwarding active while silencing the remote
+  ("stop hearing them move around while I work"). Spoken feedback
+  on toggle: "Orca Remote: remote muted." / "remote unmuted."
+- **Bypass-chord list in `_on_keyboard_event`.** Tracks the
+  Orca-modifier (Insert / Caps_Lock) press/release count
+  separately. When the user holds Orca-mod and presses one of
+  the five orca-remote chords (Ctrl+R / Ctrl+M / Ctrl+PgUp /
+  Ctrl+PgDn / Alt+Tab), the trigger keysym is NOT forwarded;
+  Orca dispatches the local binding instead. Every other Orca
+  or NVDA chord (Insert+Down for sayAll, review keys, etc.)
+  continues to forward so the remote screen reader can act on it.
+- **switch_side announces mute state on re-entry.** "Orca Remote:
+  focused on remote machine. Muted." when returning to remote
+  with the mute flag still set; plain "focused on remote machine."
+  when unmuted. Mute persists across switch_side toggles.
+- **Grab-fail count logged.** `_enable_master_grab` logs the
+  held/refused split at the debug level so users on partial-
+  coverage compositors can see what happened. Not spoken: doing
+  so on every switch_side proved too chatty, and the count varies
+  between activations as the X grab table changes.
+
+### Changed
+
+- **`_focus_on_remote` default flipped to False.** Extension now
+  loads in a known-quiet state; the first Insert+Alt+Tab enables
+  both grab + hearing together. Symmetric with the inverse toggle.
+- **Insert+Ctrl+R now opens the settings dialog directly.** No
+  more intermediate menu.
+- **Settings dialog singleton: destroy + rebuild instead of
+  present.** `present()` doesn't reliably re-raise an alive-but-
+  unfocused window on marco / Wayland-flagged sessions; tearing
+  down first guarantees a freshly-mapped focused window every
+  time.
+- **`_OWN_CTRL_CHORD_KEYSYMS` now includes 0x6d (XK_m).** Used by
+  both the host-side refusal check (existing behavior) and the
+  new master-side bypass check.
+
+### Known limitation
+
+- The bypass list captures only the five orca-remote command
+  chords. Any custom Orca command the user binds to a chord that
+  uses Orca-mod + Ctrl/Alt + one of {r, m, PgUp, PgDn, Tab} will
+  also be intercepted and not forwarded -- there's no way for the
+  bypass logic to distinguish "orca-remote owns this" from
+  "another extension owns this." If a user hits this, a future
+  release can either query the controller's command registry at
+  grab time or expose the bypass list as a setting.
+
+## 0.7.1 -- 2026-05-22
+
+Fix: Orca+Ctrl+R menu was silently failing to appear on sessions
+where `XDG_SESSION_TYPE=wayland` is set even though the actual
+display server is X11 (Fedora MATE's default). `Gtk.Menu.popup_at_
+pointer` returned without raising but the menu never became
+visible, and the screen-reader user heard nothing because there
+was nothing on screen to read.
+
+- Replaced the Gtk.Menu popup with a Gtk.Window-based dialog
+  (same shape as `build_settings_dialog`, which already worked
+  on the affected session). The window doesn't depend on pointer
+  position or on Orca owning an active GTK toplevel.
+- Same actions, same state-aware item set. Focus traversal is
+  standard Tab/Shift+Tab; Escape and the Close button dismiss.
+- `open_menu` now hooks `destroy` instead of `selection-done`
+  for singleton cleanup (Gtk.Window doesn't have selection-done).
+
 ## 0.7.0 -- 2026-05-21
 
 Master-side full system-level key consume via vendored

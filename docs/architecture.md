@@ -246,12 +246,56 @@ still happens through `_on_keyboard_event` (which fires from
 input_event_manager regardless of whether the event was
 AT-SPI-grabbed). The grab's only job is the focused-app block.
 
-F11 is intentionally NOT in the grabbed keysym set:
-`forwardable_keysyms()` returns the set `keysym_to_vk` knows
-how to map, and F11 is special-cased in `_on_keyboard_event`
-to fire `switch_side` instead. Keeping F11 un-grabbed ensures
-the escape path always works -- even on a compositor where
-KeysetGrab partially or wholly fails.
+#### Local-command bypass (0.8.0)
+
+The user still needs to fire orca-remote's own commands locally
+while master-mode forwarding is active. 0.6.x / 0.7.x used F11 as
+a hard escape: press F11 to exit forwarding mode, then the user
+could use any Orca chord normally. That worked but was
+single-purpose -- you could only escape, not invoke a specific
+command in place.
+
+0.8.0 replaces the F11 escape with a per-chord bypass:
+
+1. `_on_keyboard_event` tracks Orca-mod press/release into
+   `_master_orca_mod_held` (counter, not bool, so Insert +
+   KP_Insert held together balance correctly). Orca-mod keysyms:
+   Insert, KP_Insert, Caps_Lock, Shift_Lock.
+
+2. The Orca-mod keysyms themselves are STILL forwarded to the
+   remote so its screen reader sees Insert/Caps_Lock state come
+   through (NVDA needs Insert held to interpret Insert+Down as
+   sayAll, etc.).
+
+3. `_is_local_bypass_chord(keysym, modifiers)` checks whether the
+   trigger keysym matches one of orca-remote's own command chords:
+   - `_OWN_CTRL_CHORD_KEYSYMS` × Ctrl bit: r / m / Page_Up /
+     Page_Down / KP_Page_Up / KP_Page_Down
+   - `_OWN_ALT_CHORD_KEYSYMS` × Alt bit: Tab
+   AND the user is currently holding Orca-mod.
+
+4. If the bypass matches, `_on_keyboard_event` returns False --
+   the trigger keysym is NOT forwarded, Orca's binding dispatcher
+   fires the registered handler locally.
+
+The component modifier keys (Insert, Ctrl, Alt) ARE forwarded.
+The remote screen reader sees Insert+Ctrl held but no trigger
+key arrives -- it treats the chord as Insert+Ctrl pressed-and-
+released-with-nothing-between, which is a no-op for both NVDA
+and Orca. Slight oddity but harmless.
+
+Every other chord, including all standard NVDA/Orca commands
+(Insert+Down for sayAll, Insert+T for window title, Insert+End
+for status bar, etc.), is forwarded unchanged so the remote
+screen reader can act on it.
+
+**Known limitation**: a user binding an unrelated Orca extension
+to one of {Ctrl+r, Ctrl+m, Ctrl+PgUp, Ctrl+PgDn, Alt+Tab} with
+Orca-mod would have their chord intercepted by our bypass and
+not forwarded -- the bypass logic can't distinguish "orca-remote
+owns this" from "someone else owns this." Resolvable later by
+querying the controller's command registry or surfacing the
+bypass list as a setting.
 
 #### Compositor coverage
 
