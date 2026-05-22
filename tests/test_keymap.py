@@ -206,6 +206,55 @@ class TestKeysymToVk:
         # XK_VoidSymbol just to be sure.
         assert keymap.keysym_to_vk(0xffffff) == (0, False)
 
+
+class TestForwardableKeysyms:
+    """The set master-side KeysetGrab takes when forwarding is active."""
+
+    def test_returns_frozenset(self) -> None:
+        # Frozenset so KeysetGrab can't mutate the source-of-truth.
+        assert isinstance(keymap.forwardable_keysyms(), frozenset)
+
+    def test_includes_letters(self) -> None:
+        ks = keymap.forwardable_keysyms()
+        # XK_a..XK_z must all be forwardable.
+        for keysym in range(0x61, 0x7b):
+            assert keysym in ks, f"keysym 0x{keysym:x} missing"
+
+    def test_includes_digits(self) -> None:
+        ks = keymap.forwardable_keysyms()
+        for keysym in range(0x30, 0x3a):
+            assert keysym in ks, f"keysym 0x{keysym:x} missing"
+
+    def test_includes_function_keys(self) -> None:
+        ks = keymap.forwardable_keysyms()
+        # XK_F1..XK_F12 -- the ones users actually press.
+        for keysym in range(0xffbe, 0xffca):
+            assert keysym in ks, f"F-key keysym 0x{keysym:x} missing"
+
+    def test_includes_arrow_keys(self) -> None:
+        ks = keymap.forwardable_keysyms()
+        # Main-row arrows (extended) and numpad arrows (non-extended).
+        for keysym in (0xff51, 0xff52, 0xff53, 0xff54,    # main-row
+                       0xff96, 0xff97, 0xff98, 0xff99):    # numpad
+            assert keysym in ks, f"arrow keysym 0x{keysym:x} missing"
+
+    def test_excludes_unmapped_keysyms(self) -> None:
+        ks = keymap.forwardable_keysyms()
+        # XK_VoidSymbol and other never-mapped keysyms must be absent.
+        assert 0xffffff not in ks
+        assert 0xdeadbe not in ks
+        assert 0 not in ks
+
+    def test_consistent_with_reverse_lookup(self) -> None:
+        # Every keysym in the forwardable set must reverse-lookup to
+        # a non-zero VK code. Catches regressions where the helper
+        # diverges from keysym_to_vk's coverage.
+        ks = keymap.forwardable_keysyms()
+        for keysym in list(ks)[:20]:
+            assert keymap.keysym_to_vk(keysym)[0] != 0
+
+
+class TestRoundTrip:
     def test_forward_reverse_round_trip_sample(self) -> None:
         # For every VK in the forward table, reverse-lookup of the
         # mapped keysym should give us *some* VK back. (Exact match

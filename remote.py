@@ -53,10 +53,22 @@ from .settings_dialog import (
     SETTING_ROLE,
     build_settings_dialog,
 )
-from .keymap import keysym_to_vk, vk_to_keysym
+from .keymap import forwardable_keysyms, keysym_to_vk, vk_to_keysym
 from .protocol import CONNECTION_TYPE_MASTER, CONNECTION_TYPE_SLAVE
 from .remote_menu import build_remote_menu
 from .transport import RemoteTransport
+
+# Vendored orca-ext-utils (see vendor/UPDATE.md for sync notes). The
+# import is guarded so an extension built without the vendor tree
+# (developer running from a source checkout that hasn't synced yet)
+# degrades to "Orca-dispatch consume only" rather than crashing on
+# load.
+try:
+    from .vendor.orca_ext_utils.keyboard_grab import KeysetGrab
+    _HAVE_KEYSET_GRAB = True
+except Exception:  # pylint: disable=broad-except
+    KeysetGrab = None  # type: ignore[assignment,misc]
+    _HAVE_KEYSET_GRAB = False
 
 
 _SETTINGS_FILENAME = "orca-remote-settings.json"
@@ -176,6 +188,16 @@ class RemoteExtension(Extension):
         # response callback before destroy.
         self._menu_dialog: Any = None
         self._settings_dialog: Any = None
+        # KeysetGrab active while master-mode forwarding is on. When
+        # set, the forwardable-keysym set is grabbed at the AT-SPI
+        # level so the focused local app stops receiving keys we're
+        # already sending on the wire. None when not forwarding or
+        # when the grab is unavailable (vendored ext-utils missing,
+        # AT-SPI couldn't construct a Device, compositor refused).
+        # See vendor/orca_ext_utils/keyboard_grab.py for the grab
+        # semantics. Decision rationale in docs/architecture.md
+        # "Master-side full consume."
+        self._master_grab: "KeysetGrab | None" = None
         super().__init__()
 
     # ---- lifecycle -------------------------------------------------
@@ -259,6 +281,9 @@ class RemoteExtension(Extension):
             self.controller.unsubscribe_keyboard_event(self._on_keyboard_event)
         except AttributeError:
             pass
+        # Release the master-mode KeysetGrab if one is held. Safe to
+        # call when nothing's held (no-op).
+        self._disable_master_grab()
         self._stop_transport()
         # Belt-and-braces: _stop_transport already drains held keys,
         # but if there was no transport to stop (e.g. extension toggled
@@ -331,13 +356,21 @@ class RemoteExtension(Extension):
           are NOT consumed -- Orca processes them normally so an
           exotic key isn't silently swallowed.
 
-        LIMITATION: this is Orca-dispatch consume only. The key
-        still reaches the focused application via the X server.
-        Practical effect: while forwarding, your local Orca won't
-        fire commands on the keys, but they ALSO type into whatever
-        local app has focus. Full system-level consume needs
-        Atspi.Device.add_key_grab (per-keysym) -- a future
-        enhancement, see docs/architecture.md "Deferred work."
+        Full-consume model (0.7.0+): while focused-on-remote is
+        active, `_enable_master_grab` registers a KeysetGrab over
+        `forwardable_keysyms()`. That grab takes the keys off the
+        focused application's AT-SPI delivery, so forwarded keys
+        only act on the remote machine -- not also on the focused
+        local app. The grab's callback is a no-op consume; the
+        actual forwarding still happens here (input_event_manager
+        still fires this hook even for AT-SPI-grabbed events).
+
+        Compositor coverage: KeysetGrab works on X11 (Xorg). On
+        Wayland it works for compositors that honor AT-SPI grabs;
+        for those that don't, `_master_grab.failed_keysyms` lists
+        the rejected pairs and the focused app continues to see
+        those keys (degrades to pre-0.7.0 Orca-dispatch-only
+        consume for the unaccepted subset).
         """
 
         # Cheap guards first so non-forwarding sessions pay nothing.
@@ -558,6 +591,11 @@ class RemoteExtension(Extension):
         way. On the slave (host), this is a silent no-op -- matching
         how NVDA Remote ignores F11-equivalents on the controlled
         machine.
+
+        Side effect: entering focused-on-remote mode activates a
+        KeysetGrab over the forwardable keysym set so the focused
+        local app stops receiving keys we forward on the wire.
+        Leaving the mode releases the grab.
         """
 
         if self._current_role() != ROLE_CLIENT:
@@ -565,10 +603,63 @@ class RemoteExtension(Extension):
 
         self._focus_on_remote = not self._focus_on_remote
         if self._focus_on_remote:
+            self._enable_master_grab()
             self._say("Orca Remote: focused on remote machine.")
         else:
+            self._disable_master_grab()
             self._say("Orca Remote: focused on local machine.")
         return True
+
+    def _enable_master_grab(self) -> None:
+        """Take ownership of forwardable keys at the AT-SPI level.
+
+        No-op when KeysetGrab isn't available (vendored ext-utils
+        missing) or when a grab is already in place. Logs how many
+        of the requested keysym/modifier pairs the AT-SPI device
+        accepted vs refused; partial coverage is normal under
+        compositors that don't honor every grab.
+        """
+
+        if self._master_grab is not None:
+            return
+        if not _HAVE_KEYSET_GRAB or KeysetGrab is None:
+            self._log(
+                "KeysetGrab unavailable (vendored ext-utils missing); "
+                "forwarded keys will also reach the focused local app"
+            )
+            return
+        keysyms = forwardable_keysyms()
+        grab = KeysetGrab(keysyms)
+        try:
+            grab.__enter__()
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"KeysetGrab.__enter__ raised: {error}")
+            return
+        # The grab callback fires on AT-SPI key events for grabbed
+        # keys. Forwarding still happens via `_on_keyboard_event`
+        # (which Orca's input_event_manager calls); the grab's only
+        # job here is to prevent the focused local app from also
+        # seeing the key, so the callback just consumes. Returning
+        # True from the registered callback marks the event as
+        # consumed at the AT-SPI level.
+        grab.register(lambda _event: True)
+        self._master_grab = grab
+        held = len(keysyms) * len(grab._modifier_combos) - len(grab.failed_keysyms)
+        self._log(
+            f"master grab active: {held} grabs held, "
+            f"{len(grab.failed_keysyms)} refused"
+        )
+
+    def _disable_master_grab(self) -> None:
+        """Release the master-mode KeysetGrab if one is held."""
+
+        if self._master_grab is None:
+            return
+        try:
+            self._master_grab.release()
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"KeysetGrab.release raised: {error}")
+        self._master_grab = None
 
     def open_settings(self) -> bool:
         """Show the non-blocking settings dialog; apply on OK.

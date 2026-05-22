@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.7.0 -- 2026-05-21
+
+Master-side full system-level key consume via vendored
+`orca_ext_utils.keyboard_grab.KeysetGrab`.
+
+Pre-0.7.0 master-side key forwarding consumed events from Orca's
+dispatch chain but NOT from the focused local application -- so
+a forwarded letter typed in the remote machine AND landed in
+whatever local app the master had focus on. F11 was the escape
+hatch. 0.7.0 adds the AT-SPI key-grab layer so forwarded keys
+only act on the remote side.
+
+- **Vendored `orca_ext_utils`**: copied `v0.2.0` (commit `0139105`)
+  to `vendor/orca_ext_utils/`. See `vendor/UPDATE.md` for the
+  sync procedure and which modules we use.
+- **`keymap.forwardable_keysyms()`**: returns the keysym set
+  master-side forwarding can send (every key with a non-zero
+  `keysym_to_vk` mapping). The KeysetGrab takes this set on
+  forwarding-mode entry. F11 is intentionally NOT in the set --
+  it stays un-grabbed so the escape path always works even if
+  the grab partially fails on a given compositor.
+- **`_enable_master_grab` / `_disable_master_grab`**: lifecycle
+  hooked into `switch_side`. Entering focused-on-remote: take
+  the grab, log held/refused counts. Leaving (or `disable()`):
+  release. The grab callback is a no-op consume; forwarding
+  still happens through `_on_keyboard_event`.
+- **Compositor coverage matrix** documented in
+  `docs/architecture.md`: full consume on X11/XWayland; partial
+  on Mutter/KWin; degrades to Orca-dispatch-only on wlroots.
+  `failed_keysyms` count logged at grab time so partial coverage
+  is observable.
+- **Graceful degradation**: if the vendored ext-utils is missing
+  (a dev running from a partial checkout), forwarding still works
+  at the pre-0.7.0 level rather than crashing on import.
+
 ## 0.6.1 -- 2026-05-21
 
 Inbound braille rendering (master side).

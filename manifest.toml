@@ -1,16 +1,17 @@
 [extension]
 name = "remote"
 display-name = "Orca Remote"
-version = "0.6.1"
+version = "0.7.0"
 author = "Cody Hurst <codythurst@gmail.com>"
 license = "LGPL-2.1-or-later"
 url = "https://github.com/churst90/orca-remote"
 description = """
 NVDA-Remote-compatible remote access for Orca. Bidirectional
-speech mirroring across an NVDA Remote v2.x relay: act as a
-client (receive remote speech) or as a host (broadcast our
-speech). Role and connect/disconnect chords are configurable;
-key forwarding lands in a later release.
+speech and braille mirroring across an NVDA Remote v2.x relay:
+act as a client (receive remote speech) or as a host (broadcast
+our speech). Master-side key forwarding with full system-level
+consume (KeysetGrab) so forwarded keys only act on the remote
+machine. F11 escape returns control to the local side.
 """
 
 [compatibility]

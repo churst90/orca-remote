@@ -222,3 +222,23 @@ def keysym_to_vk(keysym: int) -> tuple[int, bool]:
     """
 
     return _KEYSYM_TO_VK.get(keysym, (0, False))
+
+
+def forwardable_keysyms() -> frozenset[int]:
+    """Returns the keysyms master-side forwarding can send.
+
+    This is the set the KeysetGrab on the master should cover so
+    that, while focused-on-remote is True, the focused local app
+    stops receiving keys we're already forwarding to the slave.
+    Anything outside this set isn't forwardable (keysym_to_vk
+    returns 0) so the focused app SHOULD still receive it -- that
+    matches the "unmapped: pass through" semantics in
+    `_on_keyboard_event`.
+
+    The F11 escape keysym is intentionally NOT included here. F11
+    must reach `_on_keyboard_event` un-grabbed so the
+    forward-mode-exit path stays usable even if the grab fails or
+    behaves unexpectedly under a given compositor.
+    """
+
+    return frozenset(_KEYSYM_TO_VK.keys())

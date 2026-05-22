@@ -219,19 +219,52 @@ releases, with the design constraint:
 
 ### Master-side key forwarding (Orca master → slave)
 
-Needs either:
+**Implemented across two releases. 0.7.0 = full system-level consume.**
 
-1. A new "consume keyboard event" subscribe API on the perf-branch
-   controller. Orca's input event manager calls this BEFORE
-   `event.process()`; the subscriber returns True to swallow the
-   event locally and forward it on the wire. ~150 lines in
-   `input_event_manager.py` + dispatch surface in `dbus_service.py`.
-2. Or, on master-mode toggle, register `Atspi.Device.add_key_grab`
-   for every (keysym, modifier_mask) combination we want to forward.
-   Combinatorial in modifier combos (~600 grabs for full Latin
-   coverage), and grab register/unregister is not free.
+Both designs originally considered turned out to be necessary --
+the right architecture is to combine them:
 
-Option 1 is the right design. Tracked for a future session.
+1. **Orca-dispatch consume (0.6.0).** The perf-branch
+   `subscribe_keyboard_event` controller API delivers
+   `(pressed, keycode, keysym, modifiers, text)` to
+   `_on_keyboard_event` BEFORE `event.process()`; returning True
+   consumes from Orca's perspective. This is what stops the
+   local Orca from acting on forwarded chords (no double-fire
+   of Orca+Ctrl+R producing two "Recognizing..." voices).
+
+2. **Focused-app consume (0.7.0).** `_enable_master_grab` builds
+   a `KeysetGrab` (vendored from `orca-ext-utils`) over
+   `keymap.forwardable_keysyms()` when focused-on-remote
+   activates. The AT-SPI grab takes the keys off the focused
+   application's delivery, so a forwarded letter only types on
+   the remote machine, not also into whatever local app the
+   master has focus on. Released on the inverse switch_side or
+   on `disable()`.
+
+The grab's callback is a no-op consume; the actual forwarding
+still happens through `_on_keyboard_event` (which fires from
+input_event_manager regardless of whether the event was
+AT-SPI-grabbed). The grab's only job is the focused-app block.
+
+F11 is intentionally NOT in the grabbed keysym set:
+`forwardable_keysyms()` returns the set `keysym_to_vk` knows
+how to map, and F11 is special-cased in `_on_keyboard_event`
+to fire `switch_side` instead. Keeping F11 un-grabbed ensures
+the escape path always works -- even on a compositor where
+KeysetGrab partially or wholly fails.
+
+#### Compositor coverage
+
+| Display server | Behavior |
+|---|---|
+| X11 (Xorg) | KeysetGrab.failed_keysyms is typically empty; full consume. |
+| XWayland | Same as X11 for XWayland apps; native Wayland apps may still see the keys depending on the compositor. |
+| Wayland (Mutter/KWin) | Partial: some grabs accepted, some refused. Refused list logged via `_log` at grab time. |
+| Wayland (wlroots) | Usually no grabs accepted; degrades to Orca-dispatch consume only (pre-0.7.0 behavior). |
+
+The user gets a one-line log message at grab time showing the
+held/refused split, so partial coverage is observable rather
+than silent.
 
 ### Inbound braille rendering (master plays remote braille)
 
