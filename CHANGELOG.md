@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.8.1 -- 2026-05-22
+
+Bug fix: stop X11 from auto-repeating synthesized inbound keys.
+
+### Fixed
+
+- **Host-side freeze on first inbound non-modifier key.**
+  `_synthesize_key_idle_cb` used to call
+  `controller.synthesize_key_event(keysym, True)` for an inbound
+  PRESS frame and wait for the master's wire RELEASE to call the
+  matching `(keysym, False)`. On X11 that leaves the key in the
+  server's "held" state, at which point the X server itself starts
+  dispatching real auto-repeat Pressed events at ~30 Hz -- one
+  inbound `H` frame from an NVDA master became hundreds of host-side
+  H presses, Orca's main loop saturated processing them as discrete
+  `previous_heading` commands, and the session looked frozen.
+  Reproduced with 772 PRESS / 0 RELEASE events for `H` in 10 seconds,
+  Orca CPU pegged at ~55%.
+
+  Fix: tap mode for non-modifier keysyms. On an accepted inbound
+  PRESS we synthesize the PRESS *and* immediately synthesize the
+  matching RELEASE in the same idle callback, then bookkeep the
+  keysym in `_pressed_keysyms` so the dedupe path keeps collapsing
+  NVDA's per-physical-tap PRESS bursts to one event. The wire
+  RELEASE arriving later is a no-op (X already released). Modifier
+  keysyms (`_STICKY_KEYSYMS`: Shift / Ctrl / Alt / Meta / Super /
+  Hyper / ISO_Level3_Shift / ISO_Level5_Shift / Insert / KP_Insert)
+  stay sticky -- they hold across multiple inbound frames so chords
+  like Insert+H or Ctrl+Tab still work.
+
+### Added
+
+- `tests/test_synth_keys.py` -- 9 tests covering tap mode for
+  letters, sticky mode for modifiers, chord composition, dedupe
+  across duplicate PRESS frames, own-command refusal, and synth
+  failure handling.
+
 ## 0.8.0 -- 2026-05-22
 
 UX rework: replace the menu/dialog with direct shortcuts; replace

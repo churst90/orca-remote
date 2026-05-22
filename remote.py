@@ -84,6 +84,29 @@ _ORCA_MOD_KEYSYMS: frozenset[int] = frozenset({
 _CTRL_KEYSYMS: frozenset[int] = frozenset({0xffe3, 0xffe4})
 _ALT_KEYSYMS: frozenset[int] = frozenset({0xffe9, 0xffea})
 
+# Keysyms we hold across multiple inbound frames so chords work (Orca-mod
+# + Ctrl + letter style). Every other keysym is tapped -- PRESS plus an
+# immediate matching RELEASE in the same idle callback -- to keep X11's
+# own auto-repeat from kicking in. NVDA Remote forwards one PRESS frame
+# per physical tap on the master; on X11, a synthesized PRESS without a
+# RELEASE leaves the key in the server's "held" state, at which point
+# the X server itself starts dispatching real key events at ~30 Hz, one
+# inbound H frame becomes a flood of host-side H presses, and Orca's
+# main loop saturates trying to keep up. Holding only the modifier set
+# below preserves chord semantics while everything else taps cleanly.
+_STICKY_KEYSYMS: frozenset[int] = frozenset({
+    0xffe1, 0xffe2,  # Shift_L, Shift_R
+    0xffe3, 0xffe4,  # Control_L, Control_R
+    0xffe7, 0xffe8,  # Meta_L, Meta_R
+    0xffe9, 0xffea,  # Alt_L, Alt_R
+    0xffeb, 0xffec,  # Super_L, Super_R
+    0xffed, 0xffee,  # Hyper_L, Hyper_R
+    0xfe03,          # ISO_Level3_Shift
+    0xfe04,          # ISO_Level5_Shift
+    0xff63,          # Insert       (Orca mod, desktop layout)
+    0xff9e,          # KP_Insert    (Orca mod, laptop layout)
+})
+
 # Keysyms that, when pressed while Orca-mod + Ctrl are held, fire one
 # of our own commands. Used in two places:
 #   1. Host (slave) side: refuses inbound synthesis so a remote master
@@ -1216,17 +1239,16 @@ class RemoteExtension(Extension):
         GLib.idle_add(self._synthesize_key_idle_cb, keysym, pressed)
 
     def _synthesize_key_idle_cb(self, keysym: int, pressed: bool) -> bool:
-        # Suppress duplicate PRESS events. NVDA Remote forwards
-        # OS-level autorepeat as a stream of PRESS frames -- and the
-        # user reports that even a SINGLE physical press can arrive
-        # as multiple frames on the wire. Without this, every duplicate
-        # frame fires the bound Orca command again ("Recognizing."
-        # looping on a single Insert+R tap). Dropping any PRESS for a
-        # keysym we already have in _pressed_keysyms (i.e. we have
-        # synthesized a PRESS we haven't yet RELEASED) collapses all
-        # of those down to one event. The cost: key autorepeat for
-        # typing-style use (holding 'a' to fill a text field) is gone
-        # over the link -- the user taps for each character. Worth it.
+        # Suppress duplicate PRESS events. NVDA Remote forwards OS-level
+        # autorepeat as a stream of PRESS frames -- and a SINGLE physical
+        # press can arrive as multiple frames on the wire. Without this,
+        # every duplicate frame fires the bound Orca command again
+        # ("Recognizing." looping on a single Insert+R tap). Dropping
+        # any PRESS for a keysym already in _pressed_keysyms (PRESS
+        # accepted, no matching wire RELEASE yet) collapses the burst to
+        # one event. The cost: holding a key on master for typing-style
+        # use does not autorepeat over the link -- the user taps for
+        # each character. Worth it.
         if pressed and keysym in self._pressed_keysyms:
             return False
 
@@ -1235,14 +1257,24 @@ class RemoteExtension(Extension):
         # XTest, which Orca's own input listener picks up, and our
         # open_settings command runs on the slave -- previously a
         # blocking modal Gtk dialog. The check uses _pressed_keysyms
-        # (what we've synthesized PRESS for and not yet RELEASED), so
+        # (what we've synthesized PRESS for and not yet released), so
         # by the time the alphabetic key of the chord arrives, the
-        # modifiers are already in the set.
+        # modifier keysyms are already in the set.
         if pressed and self._chord_matches_own_command(keysym):
             self._log(
                 f"refusing own-command chord (keysym 0x{keysym:x}, "
                 f"held={sorted(self._pressed_keysyms)})"
             )
+            return False
+
+        sticky = keysym in _STICKY_KEYSYMS
+
+        # Non-sticky RELEASE arriving over the wire: the matching PRESS
+        # branch already tapped (PRESS+RELEASE) this keysym, so the X
+        # server has long since released it. Just clear the dedupe
+        # bookkeeping; do not double-synth a release.
+        if not pressed and not sticky:
+            self._pressed_keysyms.discard(keysym)
             return False
 
         ok = False
@@ -1252,17 +1284,32 @@ class RemoteExtension(Extension):
             self._log("controller has no synthesize_key_event (older Orca?)")
         except Exception as error:  # pylint: disable=broad-except
             self._log(f"synthesize_key_event raised: {error}")
-        if ok:
-            # Track press/release pairing so a dropped connection mid-pair
-            # can't leak a held key into the X server, and so the dedupe
-            # check above can spot duplicate frames. Locking keysyms
-            # (Caps_Lock / Num_Lock / Scroll_Lock) are also tracked
-            # because a stuck PRESS without a RELEASE would otherwise
-            # let a future duplicate PRESS through, double-toggling X.
-            if pressed:
-                self._pressed_keysyms.add(keysym)
-            else:
-                self._pressed_keysyms.discard(keysym)
+
+        if not ok:
+            return False
+
+        # Tap mode for non-modifier keys: immediately synth the matching
+        # RELEASE. On X11 a PRESS without a RELEASE leaves the key
+        # "held" in the server, and X dispatches its own auto-repeat
+        # events at ~30 Hz -- one wire PRESS for 'H' becomes a flood of
+        # real Pressed events that Orca processes as if the user were
+        # jackhammering the key. The auto-release breaks that loop. We
+        # still add the keysym to _pressed_keysyms below so the dedupe
+        # at the top of this function collapses NVDA's per-physical-tap
+        # PRESS frames down to one event; the eventual wire RELEASE
+        # clears it (handled by the early-return above).
+        if pressed and not sticky:
+            try:
+                self.controller.synthesize_key_event(keysym, False)
+            except Exception as error:  # pylint: disable=broad-except
+                self._log(
+                    f"synthesize_key_event (auto-release) raised: {error}"
+                )
+
+        if pressed:
+            self._pressed_keysyms.add(keysym)
+        else:
+            self._pressed_keysyms.discard(keysym)
         return False  # one-shot
 
     def _interrupt_speech_idle_cb(self) -> bool:
