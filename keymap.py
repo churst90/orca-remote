@@ -183,6 +183,23 @@ def vk_to_keysym(vk_code: int, extended: bool = False) -> int:
     return _VK_TO_KEYSYM.get(vk_code, 0)
 
 
+# Inbound-only keysym aliases: X11 keysyms that never appear in the
+# forward (VK -> keysym) table because they are layout/level
+# artifacts rather than distinct Windows VK codes, but which the X
+# server WILL deliver and master-side forwarding must therefore
+# recognize. The canonical case is Shift+Tab: X resolves it to
+# XK_ISO_Left_Tab (0xfe20), NOT XK_Tab plus a Shift modifier, so the
+# pre-alias reverse table returned (0, False) for it and
+# `_on_keyboard_event` dropped the event -- it fell through to the
+# focused local app and never reached the slave. We map such aliases
+# onto the VK their base key already uses; the held Shift is
+# forwarded as its own VK_SHIFT frame, so the slave reconstructs
+# Shift+Tab.
+_KEYSYM_ALIASES: dict[int, tuple[int, bool]] = {
+    0xfe20: (0x09, False),  # XK_ISO_Left_Tab -> VK_TAB (Shift+Tab)
+}
+
+
 # Reverse: X11 keysym -> (vk_code, extended_flag). Built once at
 # module init from the forward tables. Extended-flag bias: if a
 # keysym appears in _EXTENDED_OVERRIDES (e.g. XK_Page_Up for main-
@@ -204,6 +221,10 @@ def _build_reverse_table() -> dict[int, tuple[int, bool]]:
     for vk, keysym in _EXTENDED_OVERRIDES.items():
         if keysym != 0:
             table[keysym] = (vk, True)
+    # Aliases last. They intentionally add keysyms with no forward-
+    # table entry (e.g. ISO_Left_Tab). forwardable_keysyms() is
+    # derived from this table, so the master grab covers them too.
+    table.update(_KEYSYM_ALIASES)
     return table
 
 

@@ -254,6 +254,28 @@ class TestForwardableKeysyms:
             assert keymap.keysym_to_vk(keysym)[0] != 0
 
 
+class TestKeysymAliases:
+    """Inbound-only keysym aliases (X-delivered keysyms with no forward VK)."""
+
+    def test_iso_left_tab_maps_to_vk_tab(self) -> None:
+        # X11 delivers Shift+Tab as XK_ISO_Left_Tab (0xfe20), not
+        # XK_Tab+Shift. It must forward as VK_TAB (Shift travels as its
+        # own VK_SHIFT frame). Regression for 0.8.2.
+        assert keymap.keysym_to_vk(0xfe20) == (0x09, False)
+
+    def test_iso_left_tab_is_forwardable(self) -> None:
+        # So the master grab covers it and it doesn't leak locally.
+        assert 0xfe20 in keymap.forwardable_keysyms()
+
+    def test_plain_tab_still_maps(self) -> None:
+        # The alias must not disturb plain Tab.
+        assert keymap.keysym_to_vk(0xff09) == (0x09, False)
+
+    def test_alias_does_not_pollute_forward_table(self) -> None:
+        # Aliases are reverse-only; vk_to_keysym(VK_TAB) stays XK_Tab.
+        assert keymap.vk_to_keysym(0x09) == 0xff09
+
+
 class TestRoundTrip:
     def test_forward_reverse_round_trip_sample(self) -> None:
         # For every VK in the forward table, reverse-lookup of the

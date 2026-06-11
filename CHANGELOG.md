@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.2 -- 2026-06-11
+
+Two master-side fixes: Shift+Tab now reaches the remote, and
+forwarded navigation no longer bleeds local speech.
+
+### Fixed
+
+- **Shift+Tab was dropped instead of forwarded.** On X11, Shift+Tab
+  is delivered as the distinct keysym `XK_ISO_Left_Tab` (0xfe20),
+  not `XK_Tab` plus a Shift modifier. `keymap` had no entry for
+  0xfe20, so `keysym_to_vk` returned `(0, ...)` and
+  `_on_keyboard_event` treated it as unmapped -- it fell through to
+  the focused local app and never went on the wire, so the remote
+  never saw Shift+Tab (and it leaked locally). Added an inbound-only
+  alias table (`_KEYSYM_ALIASES`) mapping `0xfe20 -> VK_TAB`; the
+  held Shift is forwarded as its own `VK_SHIFT` frame, so the slave
+  reconstructs Shift+Tab. The alias also joins `forwardable_keysyms()`
+  so the master grab covers it.
+
+- **Forwarded navigation bled local speech ("I hear my own icons").**
+  While focused-on-remote, arrow keys were forwarded to the slave
+  *and* still acted on the local desktop, so local Orca spoke the
+  local focus changes. Root cause: the focused-app block relied on a
+  standalone `Atspi.Device.new()` grab (the vendored `KeysetGrab`),
+  whose grabs registered but did not actually consume from the
+  focused application -- whereas Orca's *own* command-key grabs (on
+  its named `Atspi.Device.new_full("org.gnome.Orca")` device) do
+  consume reliably. `_enable_master_grab` now grabs the forwardable
+  keysyms through Orca's own device via `ax_device_manager`, the same
+  mechanism Orca uses for its command keys. The old `KeysetGrab` path
+  is kept as a fallback for environments where Orca's device is
+  unreachable. No "notifications vs navigation" speech filtering is
+  needed: with the keys truly consumed, local navigation never
+  happens (so no navigation speech), while event-driven notifications
+  still speak locally.
+
 ## 0.8.1 -- 2026-05-22
 
 Bug fix: stop X11 from auto-repeating synthesized inbound keys.

@@ -132,6 +132,25 @@ _OWN_ALT_CHORD_KEYSYMS: frozenset[int] = frozenset({
 _AT_SPI_MOD_CTRL: int = 0x04
 _AT_SPI_MOD_ALT: int = 0x08
 
+# Modifier-mask combinations the master grab covers. Bits are
+# Atspi.ModifierType masks (0x01 Shift, 0x04 Ctrl, 0x08 Alt, 0x40
+# Super). The plain (0x00) entry is the important one: plain arrow-
+# key desktop navigation -- the case that bled local speech through
+# -- carries no modifier. Lock states (NumLock/CapsLock) aren't
+# enumerated here; if a lock-on grab miss is ever observed, add the
+# lock-bit variants of 0x00.
+_MASTER_GRAB_MODIFIERS: tuple[int, ...] = (
+    0x00,
+    0x01,                 # Shift
+    0x04,                 # Ctrl
+    0x08,                 # Alt
+    0x40,                 # Super
+    0x01 | 0x04,          # Shift+Ctrl
+    0x01 | 0x08,          # Shift+Alt
+    0x04 | 0x08,          # Ctrl+Alt
+    0x01 | 0x04 | 0x08,   # Shift+Ctrl+Alt
+)
+
 
 def _settings_path() -> str:
     """Absolute path to the JSON settings file."""
@@ -229,15 +248,16 @@ class RemoteExtension(Extension):
         # unreachable on marco/wayland-flagged sessions, and present()
         # doesn't reliably re-raise. Destroy-rebuild is predictable.
         self._settings_dialog: Any = None
-        # KeysetGrab active while master-mode forwarding is on. When
-        # set, the forwardable-keysym set is grabbed at the AT-SPI
-        # level so the focused local app stops receiving keys we're
-        # already sending on the wire. None when not forwarding or
-        # when the grab is unavailable (vendored ext-utils missing,
-        # AT-SPI couldn't construct a Device, compositor refused).
-        # See vendor/orca_ext_utils/keyboard_grab.py for the grab
-        # semantics. Decision rationale in docs/architecture.md
-        # "Master-side full consume."
+        # Master-mode key grab state, active while focused-on-remote.
+        # The grab takes the forwardable-keysym set off the focused
+        # local app so forwarded keys only act on the remote machine.
+        #
+        # Primary path: grab ids on Orca's OWN AT-SPI device
+        # (ax_device_manager) -- the device whose grabs reliably
+        # consume on X11. Fallback path: a standalone KeysetGrab,
+        # kept for environments where Orca's device isn't reachable.
+        # Both are None when not forwarding. See _enable_master_grab.
+        self._master_grab_ids: "list[int] | None" = None
         self._master_grab: "KeysetGrab | None" = None
         super().__init__()
 
@@ -722,21 +742,37 @@ class RemoteExtension(Extension):
         return True
 
     def _enable_master_grab(self) -> None:
-        """Take ownership of forwardable keys at the AT-SPI level.
+        """Take ownership of forwardable keys so the focused local app
+        stops receiving them while focused-on-remote.
 
-        No-op when KeysetGrab isn't available (vendored ext-utils
-        missing) or when a grab is already in place. Logs how many
-        of the requested keysym/modifier pairs the AT-SPI device
-        accepted vs refused; partial coverage is normal under
-        compositors that don't honor every grab.
+        Primary path grabs through Orca's OWN AT-SPI device
+        (`ax_device_manager`) -- the named "org.gnome.Orca" device
+        whose key grabs reliably consume from the focused application
+        on X11 (it is the same device/mechanism Orca uses to consume
+        its own command keys). A standalone `Atspi.Device.new()` grab
+        (the original KeysetGrab path, kept here as a fallback) was
+        observed to register but NOT actually block arrow keys, so
+        forwarded navigation still moved -- and spoke -- the local
+        desktop. That was the "I hear my own icons" bleed.
+
+        No-op when a grab is already held. Logs held/refused counts;
+        partial coverage is normal under compositors that don't honor
+        every grab.
         """
 
-        if self._master_grab is not None:
+        if self._master_grab_ids is not None or self._master_grab is not None:
             return
+
+        # Primary: grab through Orca's device.
+        if self._enable_master_grab_via_orca():
+            return
+
+        # Fallback: standalone KeysetGrab (pre-fix behavior).
         if not _HAVE_KEYSET_GRAB or KeysetGrab is None:
             self._log(
-                "KeysetGrab unavailable (vendored ext-utils missing); "
-                "forwarded keys will also reach the focused local app"
+                "no AT-SPI grab available (orca device unreachable and "
+                "vendored ext-utils missing); forwarded keys will also "
+                "reach the focused local app"
             )
             return
         keysyms = forwardable_keysyms()
@@ -746,35 +782,89 @@ class RemoteExtension(Extension):
         except Exception as error:  # pylint: disable=broad-except
             self._log(f"KeysetGrab.__enter__ raised: {error}")
             return
-        # The grab callback fires on AT-SPI key events for grabbed
-        # keys. Forwarding still happens via `_on_keyboard_event`
-        # (which Orca's input_event_manager calls); the grab's only
-        # job here is to prevent the focused local app from also
-        # seeing the key, so the callback just consumes. Returning
-        # True from the registered callback marks the event as
-        # consumed at the AT-SPI level.
         grab.register(lambda _event: True)
         self._master_grab = grab
         held = len(keysyms) * len(grab._modifier_combos) - len(grab.failed_keysyms)
         refused = len(grab.failed_keysyms)
-        self._log(f"master grab active: {held} grabs held, {refused} refused")
-        # Partial coverage is common on Wayland compositors that don't
-        # fully honor AT-SPI key grabs. The refused count goes to the
-        # log but NOT to speech -- speaking it on every switch_side
-        # was too chatty (and the count varies between activations
-        # depending on transient grab-table state, which is confusing).
-        # Users who want to know their coverage can grep the log.
+        self._log(
+            f"master grab active (fallback KeysetGrab): {held} held, "
+            f"{refused} refused"
+        )
+
+    def _enable_master_grab_via_orca(self) -> bool:
+        """Grab forwardable keysyms on Orca's own device.
+
+        Returns True if at least one grab was accepted (the grab is
+        now active), False if Orca's device is unreachable or refused
+        every grab (caller should fall back).
+        """
+
+        try:
+            from orca import ax_device_manager  # pylint: disable=import-outside-toplevel
+            import gi  # pylint: disable=import-outside-toplevel
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi  # pylint: disable=import-outside-toplevel
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"orca-device grab unavailable: {error}")
+            return False
+
+        try:
+            manager = ax_device_manager.get_manager()
+        except Exception as error:  # pylint: disable=broad-except
+            self._log(f"orca-device grab: get_manager failed: {error}")
+            return False
+        if manager is None or not manager.is_active():
+            self._log("orca-device grab: device manager not active")
+            return False
+
+        grab_ids: list[int] = []
+        refused = 0
+        for keysym in forwardable_keysyms():
+            for modifier in _MASTER_GRAB_MODIFIERS:
+                kd = Atspi.KeyDefinition()
+                kd.keysym = keysym
+                kd.modifiers = modifier
+                kd.keycode = 0  # AT-SPI resolves the keycode from the keysym
+                try:
+                    grab_id = manager.add_key_grab(kd)
+                except Exception:  # pylint: disable=broad-except
+                    grab_id = 0
+                if grab_id:
+                    grab_ids.append(grab_id)
+                else:
+                    refused += 1
+        if not grab_ids:
+            self._log("orca-device grab: no grabs accepted; falling back")
+            return False
+        self._master_grab_ids = grab_ids
+        self._log(
+            f"master grab active (orca device): {len(grab_ids)} held, "
+            f"{refused} refused"
+        )
+        return True
 
     def _disable_master_grab(self) -> None:
-        """Release the master-mode KeysetGrab if one is held."""
+        """Release the master-mode grab(s), whichever path is active."""
 
-        if self._master_grab is None:
-            return
-        try:
-            self._master_grab.release()
-        except Exception as error:  # pylint: disable=broad-except
-            self._log(f"KeysetGrab.release raised: {error}")
-        self._master_grab = None
+        if self._master_grab_ids is not None:
+            try:
+                from orca import ax_device_manager  # pylint: disable=import-outside-toplevel
+                manager = ax_device_manager.get_manager()
+                for grab_id in self._master_grab_ids:
+                    try:
+                        manager.remove_key_grab(grab_id)
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+            except Exception as error:  # pylint: disable=broad-except
+                self._log(f"orca-device grab release failed: {error}")
+            self._master_grab_ids = None
+
+        if self._master_grab is not None:
+            try:
+                self._master_grab.release()
+            except Exception as error:  # pylint: disable=broad-except
+                self._log(f"KeysetGrab.release raised: {error}")
+            self._master_grab = None
 
     def open_settings(self) -> bool:
         """Show the settings dialog. Bound to Insert+Ctrl+R.
